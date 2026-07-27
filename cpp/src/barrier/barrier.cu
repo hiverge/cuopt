@@ -283,6 +283,7 @@ class iteration_data_t {
       d_w_(0, lp.handle_ptr->get_stream()),
       d_v_(0, lp.handle_ptr->get_stream()),
       d_h_(lp.num_rows, lp.handle_ptr->get_stream()),
+      d_primal_rhs_(lp.num_rows, lp.handle_ptr->get_stream()),
       d_y_(0, lp.handle_ptr->get_stream()),
       d_tmp3_(lp.num_cols, lp.handle_ptr->get_stream()),
       d_tmp4_(lp.num_cols, lp.handle_ptr->get_stream()),
@@ -2018,6 +2019,7 @@ class iteration_data_t {
   rmm::device_uvector<f_t> d_w_;
   rmm::device_uvector<f_t> d_v_;
   rmm::device_uvector<f_t> d_h_;
+  rmm::device_uvector<f_t> d_primal_rhs_;
   rmm::device_uvector<f_t> d_y_;
 
   rmm::device_uvector<f_t> d_tmp3_;
@@ -2856,6 +2858,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
 
   if (!use_augmented) {
     raft::common::nvtx::range fun_scope("Barrier: GPU compute H");
+    raft::copy(data.d_primal_rhs_.data(), data.d_h_.data(), lp.num_rows, stream_view_);
     cub::DeviceTransform::Transform(
       cuda::std::make_tuple(data.d_inv_diag.data(), data.d_tmp3_.data()),
       data.d_tmp4_.data(),
@@ -3042,6 +3045,95 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         [] HD(f_t dx_residual, f_t r1_prime) { return dx_residual + r1_prime; },
         stream_view_.value());
       RAFT_CHECK_CUDA(stream_view_);
+    }
+
+    // Correct dx for round-off amplified by the D^{-1} elimination step above.
+    // In exact arithmetic A*dx == primal_rhs (that identity is exactly what
+    // defines dy through ADAT*dy = h = primal_rhs + A*D^{-1}*r1), but *materializing*
+    // dx = D^{-1}*(A'*dy - r1) can lose many digits when inv_diag spans many
+    // orders of magnitude -- which happens routinely late in the barrier
+    // iteration once many variables sit right at a bound. That error is
+    // invisible to the ADAT residual check above (y_residual), since it
+    // recomputes A*D^{-1}*A'*dy directly and never materializes dx. Here we
+    // measure the actual primal-equation residual of the materialized dx and,
+    // if it is non-negligible, remove it with one extra solve against the
+    // *already factorized* ADAT operator (essentially free -- no new
+    // factorization): since A*ddx - res2 == 0 requires ADAT*ddy == res2 for
+    // ddx = D^{-1}*A'*ddy, we solve that and add the correction into dx and dy
+    // directly, fixing the quantity that actually matters (primal feasibility of
+    // the step) rather than only the eliminated-space residual.
+    //
+    // Restricted to n_dense_columns == 0: with dense columns the factorization
+    // held by chol is the *reduced* ADAT built from inv_diag_prime, while the
+    // matvec below uses the full A and inv_diag, so operator and preconditioner
+    // would describe different systems and the refinement would not converge.
+    if (settings.barrier_iterative_refinement && data.n_dense_columns == 0) {
+      raft::common::nvtx::range fun_scope("Barrier: dx primal-residual correction");
+
+      rmm::device_uvector<f_t> d_res2(lp.num_rows, stream_view_);
+      auto cusparse_dx_corr = data.cusparse_view_.create_vector(data.d_dx_);
+      auto cusparse_res2    = data.cusparse_view_.create_vector(d_res2);
+      raft::copy(d_res2.data(), data.d_primal_rhs_.data(), lp.num_rows, stream_view_);
+      data.cusparse_view_.spmv(-1.0, cusparse_dx_corr, 1.0, cusparse_res2);
+
+      const f_t res2_norm = device_vector_norm_inf<i_t, f_t>(d_res2, stream_view_);
+      const f_t primal_rhs_norm =
+        device_vector_norm_inf<i_t, f_t>(data.d_primal_rhs_, stream_view_);
+      if (res2_norm > 1e-10 * std::max(f_t(1), primal_rhs_norm)) {
+        rmm::device_uvector<f_t> d_ddy(lp.num_rows, stream_view_);
+        RAFT_CUDA_TRY(cudaMemsetAsync(d_ddy.data(), 0, sizeof(f_t) * d_ddy.size(), stream_view_));
+
+        struct adat_correction_op_t {
+          adat_correction_op_t(iteration_data_t<i_t, f_t>& data) : data_(data) {}
+          iteration_data_t<i_t, f_t>& data_;
+
+          void a_multiply(f_t alpha,
+                          const rmm::device_uvector<f_t>& x,
+                          f_t beta,
+                          rmm::device_uvector<f_t>& y) const
+          {
+            auto cusparse_x = data_.cusparse_view_.create_vector(x);
+            auto cusparse_y = data_.cusparse_view_.create_vector(y);
+            data_.gpu_adat_multiply(alpha, x, cusparse_x, beta, y, cusparse_y,
+                                    data_.d_u_, data_.cusparse_u_, data_.cusparse_view_,
+                                    data_.d_inv_diag);
+          }
+
+          void solve(rmm::device_uvector<f_t>& b, rmm::device_uvector<f_t>& x) const
+          {
+            data_.chol->solve(b, x);
+          }
+        } correction_op(data);
+
+        iterative_refinement<i_t, f_t, adat_correction_op_t>(correction_op, d_res2, d_ddy);
+
+        rmm::device_uvector<f_t> d_ddx(lp.num_cols, stream_view_);
+        RAFT_CUDA_TRY(cudaMemsetAsync(d_ddx.data(), 0, sizeof(f_t) * d_ddx.size(), stream_view_));
+        auto cusparse_ddy = data.cusparse_view_.create_vector(d_ddy);
+        auto cusparse_ddx = data.cusparse_view_.create_vector(d_ddx);
+        // ddx <- A'*ddy
+        data.cusparse_view_.transpose_spmv(1.0, cusparse_ddy, 0.0, cusparse_ddx);
+        cub::DeviceTransform::Transform(
+          cuda::std::make_tuple(data.d_inv_diag.data(), d_ddx.data()),
+          d_ddx.data(),
+          d_ddx.size(),
+          [] HD(f_t inv_diag, f_t v) { return inv_diag * v; },
+          stream_view_.value());
+
+        cub::DeviceTransform::Transform(
+          cuda::std::make_tuple(data.d_dx_.data(), d_ddx.data()),
+          data.d_dx_.data(),
+          data.d_dx_.size(),
+          [] HD(f_t a, f_t b) { return a + b; },
+          stream_view_.value());
+        cub::DeviceTransform::Transform(
+          cuda::std::make_tuple(data.d_dy_.data(), d_ddy.data()),
+          data.d_dy_.data(),
+          data.d_dy_.size(),
+          [] HD(f_t a, f_t b) { return a + b; },
+          stream_view_.value());
+        RAFT_CHECK_CUDA(stream_view_);
+      }
     }
 
     // Not put on the GPU since debug only
