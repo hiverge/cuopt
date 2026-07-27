@@ -95,7 +95,8 @@ class barrier_solver_t {
   i_t gpu_compute_search_direction(iteration_data_t<i_t, f_t>& data,
                                    f_t& dual_perturb,
                                    f_t& primal_perturb,
-                                   f_t& max_residual);
+                                   f_t& max_residual,
+                                   f_t ir_tol = 1e-11);
 
  private:
   simplex::lp_status_t check_for_suboptimal_solution(iteration_data_t<i_t, f_t>& data,

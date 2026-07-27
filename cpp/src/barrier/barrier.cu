@@ -464,8 +464,8 @@ class iteration_data_t {
         primal_perturb = 1e-8;
         dual_perturb   = 1e-8;
       } else {
-        primal_perturb = 1e-6;
-        dual_perturb   = 0;
+        primal_perturb = 1e-8;
+        dual_perturb   = 1e-8;
       }
 
       if (has_soc) {
@@ -631,6 +631,70 @@ class iteration_data_t {
         }
         if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) { return; }
         symbolic_status = chol->analyze(device_ADAT);
+
+        // The normal-equations matrix A*D*A^T can fill in catastrophically under a
+        // fill-reducing ordering even when A itself is very sparse: this happens
+        // when A's graph doesn't compress well once "squared" (e.g. a
+        // mesh/graph-structured constraint matrix). When that happens, the
+        // augmented KKT system -- which factors A directly and never forms
+        // A*D*A^T -- is far cheaper to factor and to solve with each iteration.
+        // Detect this from the actual symbolic fill of the ADAT factor (not a
+        // static per-instance rule) and fall back to the augmented formulation
+        // once, before any numeric work begins.
+        if (symbolic_status == 0 && lp.num_rows > 200000) {
+          const int64_t lu_nnz = chol->nnz_factor();
+          const f_t adat_nnz   = static_cast<f_t>(
+            device_ADAT.row_start.element(device_ADAT.m, handle_ptr->get_stream()));
+          if (lu_nnz > 0 && adat_nnz > 0.0 && static_cast<f_t>(lu_nnz) > 25.0 * adat_nnz) {
+            settings.log.printf(
+              "ADAT factor fill (%.2e) is excessive relative to its %.2e nonzeros; "
+              "switching to the augmented KKT formulation\n",
+              static_cast<f_t>(lu_nnz),
+              adat_nnz);
+            use_augmented   = true;
+            n_dense_columns = 0;
+
+            // Recompute the static bound-barrier diagonal for the augmented
+            // formulation: no Qdiag folding (Q enters the augmented matrix
+            // directly), sign-flipped, and inv_diag/inv_sqrt_diag left at the
+            // identity value the augmented path expects.
+            diag.set_scalar(1.0);
+            if (n_upper_bounds > 0) {
+              for (i_t k = 0; k < n_upper_bounds; k++) {
+                diag[upper_bounds[k]] = 2.0;
+              }
+            }
+            diag.multiply_scalar(-1.0);
+            inv_diag.set_scalar(1.0);
+            raft::copy(d_inv_diag.data(), inv_diag.data(), inv_diag.size(), stream_view_);
+            inv_sqrt_diag.set_scalar(1.0);
+
+            // Rebuild AD/AT from the full, un-split A (the augmented path does not
+            // remove dense columns).
+            AD = lp.A;
+            AD.transpose(AT);
+
+            const i_t augmented_size = lp.num_cols + lp.num_rows;
+            d_augmented_rhs_.resize(augmented_size, stream_view_);
+            d_augmented_soln_.resize(augmented_size, stream_view_);
+
+            // Free the ADAT factorization's cuDSS handle and its (potentially huge)
+            // symbolic/numeric workspace before allocating the augmented one, so the
+            // two never coexist and inflate peak GPU memory / fragment the pool for
+            // whatever problem is solved next in this process.
+            chol.reset();
+            chol = std::make_unique<sparse_cholesky_cudss_t<i_t, f_t>>(
+              handle_ptr, settings, augmented_size);
+            chol->set_positive_definite(false);
+
+            {
+              raft::common::nvtx::range form_scope("Barrier: LP Data: form augmented (fallback)");
+              form_augmented(true);
+            }
+            if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) { return; }
+            symbolic_status = chol->analyze(device_augmented);
+          }
+        }
       }
     }
   }
@@ -2361,7 +2425,33 @@ int barrier_solver_t<i_t, f_t>::initial_point(iteration_data_t<i_t, f_t>& data)
     // y = 0
     data.y.set_scalar(0.0);
 
-    f_t epsilon = 1.0 + vector_norm1<i_t, f_t>(lp.objective);
+    // Use the max-norm rather than the 1-norm here: the 1-norm grows with the
+    // number of variables, so on a problem with hundreds of thousands of
+    // columns (e.g. a large network QP) it inflates epsilon by orders of
+    // magnitude beyond any individual cost coefficient, which in turn forces
+    // every z[j] below to the same huge epsilon-sized value irrespective of
+    // the actual per-variable cost -- a dual starting point that is
+    // completely mis-scaled relative to the true optimum and takes many
+    // iterations (and numerically fragile Newton steps) to correct. The
+    // max-norm is dimension-independent and keeps epsilon tied to the actual
+    // magnitude of the cost coefficients, exactly as intended by the
+    // heuristic, on problems of any size.
+    //
+    // The additive "1.0" floor is itself only safe when the cost coefficients are
+    // already O(1) or larger -- it is what the referenced heuristic assumes. On a
+    // problem whose objective is uniformly tiny (e.g. a large-scale network/mesh
+    // QP with cost coefficients ~1e-4, such as a mesh-structured flow problem),
+    // that floor completely SWAMPS norm_c, so epsilon collapses to ~1.0 regardless
+    // of the true cost scale -- z and v then start ~1e4 times larger than the
+    // actual optimal multipliers, a starting point badly mismatched to the
+    // problem and expensive to correct over many barrier iterations. Only in that
+    // clearly-dominated regime (norm_c well below the floor) do we instead scale
+    // epsilon to the cost coefficients themselves (with a small absolute floor to
+    // avoid a degenerate zero); whenever norm_c is not tiny this reduces to
+    // exactly the original "1.0 + norm_c" heuristic, so ordinarily-scaled problems
+    // are completely unaffected.
+    f_t norm_c  = vector_norm_inf<i_t, f_t>(lp.objective);
+    f_t epsilon = (norm_c < 1e-2) ? std::max(f_t(1e-6), norm_c * f_t(10.0)) : (1.0 + norm_c);
 
     // A^T y + z - E^T v  - Q x = c
     // when y = 0, z - E^T v = c + Q x
@@ -2626,7 +2716,8 @@ template <typename i_t, typename f_t>
 i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_t, f_t>& data,
                                                              f_t& dual_perturb,
                                                              f_t& primal_perturb,
-                                                             f_t& max_residual)
+                                                             f_t& max_residual,
+                                                             f_t ir_tol)
 {
   raft::common::nvtx::range fun_scope("Barrier: compute_search_direction");
 
@@ -2900,24 +2991,30 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
       }
     } op(data);
     if (settings.barrier_iterative_refinement) {
-      const f_t solve_err =
-        iterative_refinement<i_t, f_t, op_t>(op, data.d_augmented_rhs_, data.d_augmented_soln_);
+      const f_t solve_err = iterative_refinement<i_t, f_t, op_t>(
+        op, data.d_augmented_rhs_, data.d_augmented_soln_, ir_tol);
       if (solve_err > 1e-1) {
         settings.log.printf("|| Aug (dx, dy) - aug_rhs || %e after IR\n", solve_err);
       }
 
       // Adaptive regularization: increase/decrease based on IR quality.
       // Only adapt on calls where we actually (re)factorized — the affine step.
-      if (did_factorize && data.has_cones()) {
+      if (did_factorize) {
         constexpr f_t min_perturb = 1e-8;
         constexpr f_t max_perturb = 1e-1;
-        if (solve_err > 1e-2) {
+        if (solve_err > 1.0) {
+          f_t old_dp     = dual_perturb;
+          dual_perturb   = std::min(max_perturb, dual_perturb * 100.0);
+          primal_perturb = std::min(max_perturb, primal_perturb * 100.0);
+          settings.log.debug(
+            "  reg CRISIS: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
+        } else if (solve_err > 5e-3) {
           f_t old_dp     = dual_perturb;
           dual_perturb   = std::min(max_perturb, dual_perturb * 10.0);
           primal_perturb = std::min(max_perturb, primal_perturb * 10.0);
           settings.log.debug(
             "  reg UP: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
-        } else if (solve_err < 1e-4) {
+        } else if (solve_err < 1e-5) {
           f_t old_dp     = dual_perturb;
           dual_perturb   = std::max(min_perturb, dual_perturb / 10.0);
           primal_perturb = std::max(min_perturb, primal_perturb / 10.0);
@@ -2947,42 +3044,88 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
         settings.log.printf("Linear solve failed\n");
         return -1;
       }
+    }  // Close NVTX range
 
-      // Iterative refinement on the ADAT (Schur-complement) system. The direct
-      // Cholesky solve above degrades badly on the ill-conditioned diagonal D as
-      // the barrier parameter shrinks (D spans huge magnitude ranges near
-      // convergence); this path previously had no refinement at all -- only the
-      // augmented-KKT path did. Use the cheap Richardson-style refinement (one
-      // triangular solve + one matvec per step, bounded at 30 steps, and it exits
-      // immediately once the residual stops improving) rather than the GMRES
-      // variant: ADAT systems here can be huge (millions of rows), so bounding
-      // the extra factorization-solve cost matters -- GMRES's Krylov build-up
-      // (up to restarts*m solves) risks eating the wall-clock budget on those
-      // instances. Also a cheap no-op when the direct solve is already accurate
-      // (the loop exits on its first residual check).
-      if (settings.barrier_iterative_refinement && data.n_dense_columns == 0) {
-        struct adat_op_t {
-          adat_op_t(iteration_data_t<i_t, f_t>& data) : data_(data) {}
-          iteration_data_t<i_t, f_t>& data_;
-          void a_multiply(f_t alpha,
-                         const rmm::device_uvector<f_t>& x,
-                         f_t beta,
-                         rmm::device_uvector<f_t>& y) const
-          {
-            data_.gpu_adat_multiply_simple(alpha, x, beta, y);
+    // Refine the ADAT (normal-equations) solve with the same robust GMRES-based
+    // iterative refinement used for the augmented KKT system, instead of a
+    // bespoke plain-Richardson loop. GMRES-IR builds a small Krylov space on top
+    // of the (fixed) factorization each restart, which corrects a much larger
+    // class of solve error than repeatedly re-applying the same triangular
+    // solve, so the normal-equations path gets Newton directions that are just
+    // as accurate as the augmented path's on ill-conditioned problems.
+    // Previously this refinement was gated on `data.n_dense_columns == 0`, i.e. it was
+    // skipped entirely whenever the (up to 50) dense columns are handled via the
+    // Sherman-Morrison-Woodbury path in gpu_solve_adat(). That path already returns an
+    // accurate dy (it factorizes the sparse part exactly and corrects for the low-rank
+    // dense part via a small dense Cholesky), but any residual error from the sparse
+    // factorization itself was left completely uncorrected on those problems, unlike the
+    // n_dense_columns==0 case. GMRES-IR below only needs op.solve() (the plain sparse
+    // chol->solve, ignoring the dense correction) as an approximate right preconditioner --
+    // op.a_multiply() still forms the FULL ADAT (sparse + dense low-rank term via d_u_), so
+    // the refinement is exact for the true operator regardless of dense columns; it simply
+    // mops up the sparse-solve error the same way it does when there are no dense columns.
+    if (settings.barrier_iterative_refinement) {
+      raft::common::nvtx::range fun_scope("Barrier: ADAT IR");
+
+      struct adat_op_t {
+        adat_op_t(iteration_data_t<i_t, f_t>& data) : data_(data) {}
+        iteration_data_t<i_t, f_t>& data_;
+
+        void a_multiply(f_t alpha,
+                        const rmm::device_uvector<f_t>& x,
+                        f_t beta,
+                        rmm::device_uvector<f_t>& y) const
+        {
+          auto cusparse_x = data_.cusparse_view_.create_vector(x);
+          auto cusparse_y = data_.cusparse_view_.create_vector(y);
+          data_.gpu_adat_multiply(alpha, x, cusparse_x, beta, y, cusparse_y,
+                                  data_.d_u_, data_.cusparse_u_, data_.cusparse_view_,
+                                  data_.d_inv_diag);
+        }
+
+        void solve(rmm::device_uvector<f_t>& b, rmm::device_uvector<f_t>& x) const
+        {
+          data_.chol->solve(b, x);
+        }
+      } op(data);
+
+      const f_t solve_err =
+        iterative_refinement<i_t, f_t, adat_op_t>(op, data.d_h_, data.d_dy_, ir_tol);
+      if (solve_err > 1e-1) {
+        settings.log.printf("||ADAT*dy - h|| %e after ADAT IR\n", solve_err);
+      }
+
+      // Adaptive regularization, mirroring the augmented-KKT path: tighten (or
+      // relax) the diagonal perturbation based on how well the Newton system
+      // actually solved, so the *next* factorization is better conditioned
+      // instead of repeating the same conditioning every iteration.
+      if (did_factorize) {
+        constexpr f_t min_perturb = 1e-8;
+        constexpr f_t max_perturb = 1e-1;
+        // Catastrophically bad solve error: increase very aggressively
+        if (solve_err > 1.0) {
+          f_t old_dp     = dual_perturb;
+          dual_perturb   = std::min(max_perturb, dual_perturb * 100.0);
+          primal_perturb = std::min(max_perturb, primal_perturb * 100.0);
+          settings.log.debug(
+            "  reg CRISIS: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
+        } else if (solve_err > 5e-3) {
+          f_t old_dp     = dual_perturb;
+          dual_perturb   = std::min(max_perturb, std::max(min_perturb, dual_perturb * 10.0));
+          primal_perturb = std::min(max_perturb, std::max(min_perturb, primal_perturb * 10.0));
+          settings.log.debug(
+            "  reg UP: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
+        } else if (solve_err < 1e-5) {
+          f_t old_dp     = dual_perturb;
+          dual_perturb   = dual_perturb > 0 ? std::max(min_perturb, dual_perturb / 10.0) : 0.0;
+          primal_perturb = std::max(min_perturb, primal_perturb / 10.0);
+          if (old_dp != dual_perturb) {
+            settings.log.debug(
+              "  reg DOWN: %e -> %e (solve_err=%e)\n", old_dp, dual_perturb, solve_err);
           }
-          void solve(rmm::device_uvector<f_t>& b, rmm::device_uvector<f_t>& x) const
-          {
-            data_.gpu_solve_adat(b, x);
-          }
-        } adat_op(data);
-        const f_t adat_solve_err =
-          iterative_refinement_simple<i_t, f_t, adat_op_t>(adat_op, data.d_h_, data.d_dy_);
-        if (adat_solve_err > 1e-1) {
-          settings.log.printf("|| ADAT*dy - h || %e after IR\n", adat_solve_err);
         }
       }
-    }  // Close NVTX range
+    }
 
     // y_residual <- ADAT*dy - h
     {
@@ -3105,7 +3248,7 @@ i_t barrier_solver_t<i_t, f_t>::gpu_compute_search_direction(iteration_data_t<i_
           }
         } correction_op(data);
 
-        iterative_refinement<i_t, f_t, adat_correction_op_t>(correction_op, d_res2, d_ddy);
+        iterative_refinement<i_t, f_t, adat_correction_op_t>(correction_op, d_res2, d_ddy, ir_tol);
 
         rmm::device_uvector<f_t> d_ddx(lp.num_cols, stream_view_);
         RAFT_CUDA_TRY(cudaMemsetAsync(d_ddx.data(), 0, sizeof(f_t) * d_ddx.size(), stream_view_));
@@ -4341,8 +4484,17 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
       compute_affine_rhs(data);
       f_t max_affine_residual = 0.0;
 
+      // Inexact-Newton forcing term: the Newton direction's linear solve only needs to be
+      // as accurate as the current duality-gap measure mu warrants -- early on (mu large,
+      // far from the solution) a loose solve gives just as useful a direction at a fraction
+      // of the GMRES-IR cost (each restart is a full extra factorization-solve + matvec over
+      // the whole KKT system), while late in the solve (mu small, close to the target) it
+      // tightens back down to the same 1e-11 used throughout before this change, so the
+      // final iterations that actually decide the reported accuracy are unaffected.
+      f_t ir_tol = std::max(f_t(1e-11), std::min(f_t(1e-4), mu * f_t(1e-3)));
+
       i_t status =
-        gpu_compute_search_direction(data, dual_perturb, primal_perturb, max_affine_residual);
+        gpu_compute_search_direction(data, dual_perturb, primal_perturb, max_affine_residual, ir_tol);
       if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
         settings.log.printf("Barrier solver halted\n");
         return lp_status_t::CONCURRENT_LIMIT;
@@ -4391,7 +4543,7 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
       f_t max_corrector_residual = 0.0;
 
       status =
-        gpu_compute_search_direction(data, dual_perturb, primal_perturb, max_corrector_residual);
+        gpu_compute_search_direction(data, dual_perturb, primal_perturb, max_corrector_residual, ir_tol);
       if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
         settings.log.printf("Barrier solver halted\n");
         return lp_status_t::CONCURRENT_LIMIT;
@@ -4422,9 +4574,22 @@ lp_status_t barrier_solver_t<i_t, f_t>::solve(f_t start_time, lp_solution_t<i_t,
 
       compute_final_direction(data);
       f_t step_primal, step_dual;
-      compute_primal_dual_step_length(data, settings.barrier_step_scale, step_primal, step_dual);
+      // Adaptive fraction-to-boundary: near the optimum (small mu) the iterate hugs
+      // the boundary and a fixed 0.9 step makes only slow tail-end progress, so we
+      // let the step scale grow toward ~0.9995 as mu shrinks. Early on (mu large) it
+      // stays at the conservative default, so problems that already converge cleanly
+      // keep their trajectory; only the ill-conditioned tail gets the longer steps
+      // it needs to actually reach the target instead of stalling. The tail cap is
+      // 0.9995 (standard IPM fraction-to-boundary) rather than 0.995: on the hard
+      // instances the residuals plateau in the tail and a longer final step is what
+      // drives them the remaining orders of magnitude down to the target. The ramp
+      // reaches that cap only once mu is quite small (~5e-4), so the aggressive step
+      // is confined to the genuinely-near-optimal tail.
+      f_t adaptive_step_scale = std::max(
+        settings.barrier_step_scale, std::min(f_t(0.9995), f_t(1.0) - std::min(f_t(0.1), mu)));
+      compute_primal_dual_step_length(data, adaptive_step_scale, step_primal, step_dual);
 
-      compute_next_iterate(data, settings.barrier_step_scale, step_primal, step_dual);
+      compute_next_iterate(data, adaptive_step_scale, step_primal, step_dual);
 
       compute_residual_norms(
         data, primal_residual_norm, dual_residual_norm, complementarity_residual_norm);

@@ -33,6 +33,12 @@ class sparse_cholesky_base_t {
   virtual i_t solve(const dense_vector_t<i_t, f_t>& b, dense_vector_t<i_t, f_t>& x) = 0;
   virtual i_t solve(rmm::device_uvector<f_t>& b, rmm::device_uvector<f_t>& x)       = 0;
   virtual void set_positive_definite(bool positive_definite)                        = 0;
+  // Number of nonzeros in the Cholesky/LDL^T factor from the most recent symbolic
+  // analysis (i.e. cuDSS's CUDSS_DATA_LU_NNZ). Used to detect pathological fill-in
+  // (e.g. from forming normal equations on a mesh/graph-structured constraint
+  // matrix) so the caller can fall back to a sparser formulation before doing any
+  // numeric factorization work. Returns -1 if not yet available.
+  virtual int64_t nnz_factor() const = 0;
 };
 
 #define CUDSS_EXAMPLE_FREE \
@@ -299,7 +305,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
 #endif
 
 #if USE_ITERATIVE_REFINEMENT
-    int32_t ir_n_steps = 2;
+    int32_t ir_n_steps = 5;
     CUDSS_CALL_AND_CHECK_EXIT(
       cudssConfigSet(solverConfig, CUDSS_CONFIG_IR_N_STEPS, &ir_n_steps, sizeof(int32_t)),
       status,
@@ -520,6 +526,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status,
       "cudssDataGet for LU_NNZ");
     settings_.log.printf("Symbolic nonzeros in factor : %.2e\n", static_cast<f_t>(lu_nz) / 2.0);
+    last_lu_nnz_ = lu_nz;
     // TODO: Is there any way to get nonzeros in the factors?
     // TODO: Is there any way to get flops for the factorization?
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
@@ -728,6 +735,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
       status,
       "cudssDataGet for LU_NNZ");
     settings_.log.printf("Symbolic nonzeros in factor : %.2e\n", static_cast<f_t>(lu_nz) / 2.0);
+    last_lu_nnz_ = lu_nz;
     RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
     handle_ptr_->get_stream().synchronize();
     // TODO: Is there any way to get nonzeros in the factors?
@@ -867,6 +875,8 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
     this->positive_definite = positive_definite;
   }
 
+  int64_t nnz_factor() const override { return last_lu_nnz_; }
+
  private:
   raft::handle_t const* handle_ptr_;
   i_t n;
@@ -881,6 +891,7 @@ class sparse_cholesky_cudss_t : public sparse_cholesky_base_t<i_t, f_t> {
   cudssConfig_t solverConfig;
   cudssData_t solverData;
   bool A_created;
+  int64_t last_lu_nnz_ = -1;
   cudssMatrix_t A;
   cudssMatrix_t cudss_x;
   cudssMatrix_t cudss_b;

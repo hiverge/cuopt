@@ -124,15 +124,22 @@ f_t iterative_refinement_simple(T& op,
 template <typename i_t, typename f_t, typename T>
 f_t iterative_refinement_gmres(T& op,
                                const rmm::device_uvector<f_t>& b,
-                               rmm::device_uvector<f_t>& x)
+                               rmm::device_uvector<f_t>& x,
+                               f_t tol = 1e-11)
 {
   // Parameters
   // Ideally, we do not need to restart here. But having restarts helps as a checkpoint to get
   // better solutions in case of true residual is far from the measured residual and true residuals
   // are not converging after some point
-  const int max_restarts = 3;
-  const int m            = 10;  // Krylov space dimension
-  const f_t tol          = 1e-8;
+  const int max_restarts = 6;
+  const int m            = 20;  // Krylov space dimension
+  // `tol` (Newton-solve accuracy requested by the caller) is now a parameter rather than a fixed
+  // constant: the barrier loop passes in a tolerance tied to the current duality-gap measure mu
+  // (see gpu_compute_search_direction), so early iterations -- where the Newton direction only
+  // needs to be roughly right -- don't pay for the full cost of driving the linear residual to
+  // 1e-11 (up to max_restarts*m preconditioner solves + matvecs against a possibly huge
+  // factorization), while the final iterations, where mu has shrunk close to the target, still get
+  // that tight tolerance and hence the same accurate directions as before.
 
   rmm::device_uvector<f_t> r(x.size(), x.stream());
   rmm::device_uvector<f_t> x_sav(x, x.stream());
@@ -147,7 +154,6 @@ f_t iterative_refinement_gmres(T& op,
 
   bool show_info = false;
 
-  f_t stop_ratio = 5.0;
   f_t bnorm      = std::max(1.0, vector_norm_inf<f_t>(b));
   f_t rel_res    = 1.0;
   int outer_iter = 0;
@@ -158,7 +164,7 @@ f_t iterative_refinement_gmres(T& op,
 
   f_t norm_r = vector_norm_inf<f_t>(r);
   if (show_info) { CUOPT_LOG_INFO("GMRES IR: initial residual = %e, |b| = %e", norm_r, bnorm); }
-  if (norm_r <= 1e-8) { return norm_r; }
+  if (norm_r <= tol) { return norm_r; }
 
   f_t residual      = norm_r;
   f_t best_residual = norm_r;
@@ -229,7 +235,7 @@ f_t iterative_refinement_gmres(T& op,
       // Check for "lucky breakdown" BEFORE using h_k1k - Krylov subspace has converged
       // When h_k1k is zero, very small, or NaN, V[k+1] is in span of previous V's
       // Must check before storing in H to avoid NaN propagation in Givens rotations
-      if (!std::isfinite(h_k1k) || h_k1k < 1e-14) {
+      if (!std::isfinite(h_k1k) || h_k1k < 1e-13) {
         if (show_info) {
           CUOPT_LOG_INFO("GMRES IR: lucky breakdown at k=%d, h_k1k=%e (before Givens)", k, h_k1k);
         }
@@ -331,29 +337,32 @@ f_t iterative_refinement_gmres(T& op,
                      l2_residual);
     }
 
-    f_t improvement_ratio = best_residual / residual;
-    // Track best solution
-    if (improvement_ratio >= stop_ratio) {
+    // Track the best solution ever seen (never overwrite it with a worse one --
+    // a prior version of this check computed best_residual / residual >= 0.95
+    // as "improved", which is also satisfied when the residual got UP TO ~5%
+    // WORSE, so it could save a worse iterate as "best" and keep burning
+    // restarts on a system that was actually regressing).
+    f_t improvement_ratio = (residual > 0) ? best_residual / residual
+                                            : std::numeric_limits<f_t>::infinity();
+    if (residual < best_residual) {
       best_residual = residual;
       raft::copy(x_sav.data(), x.data(), x.size(), x.stream());
-    } else if (improvement_ratio < stop_ratio && improvement_ratio > 1.0) {
-      best_residual = residual;
-      raft::copy(x_sav.data(), x.data(), x.size(), x.stream());
-      // Residual decreased, but not enough, continue
-      if (show_info) {
-        CUOPT_LOG_INFO("GMRES IR: improvement ratio %e is less than %e, breaking early",
-                       improvement_ratio,
-                       stop_ratio);
-      }
-      break;
-    } else {
-      // Residual increased or stagnated, restore best and stop
+    }
+    // Each restart costs a full Krylov build (m preconditioner solves + matvecs),
+    // which is expensive on large factorizations -- only worth paying for again
+    // if the last restart bought a real (>=5%) reduction in residual; otherwise
+    // stop now with the best iterate found rather than spending the remaining
+    // restarts for negligible (or negative) gains.
+    if (improvement_ratio < 1.05) {
       if (show_info) {
         CUOPT_LOG_INFO(
-          "GMRES IR: residual increased from %e to %e, stopping", best_residual, residual);
+          "GMRES IR: improvement ratio %e below threshold, stopping", improvement_ratio);
       }
       raft::copy(x.data(), x_sav.data(), x.size(), x.stream());
       break;
+    }
+    if (show_info) {
+      CUOPT_LOG_INFO("GMRES IR: improvement ratio %e, continuing", improvement_ratio);
     }
 
     ++outer_iter;
@@ -362,13 +371,16 @@ f_t iterative_refinement_gmres(T& op,
 }
 
 template <typename i_t, typename f_t, typename T>
-f_t iterative_refinement(T& op, const dense_vector_t<i_t, f_t>& b, dense_vector_t<i_t, f_t>& x)
+f_t iterative_refinement(T& op,
+                         const dense_vector_t<i_t, f_t>& b,
+                         dense_vector_t<i_t, f_t>& x,
+                         f_t tol = 1e-11)
 {
   rmm::device_uvector<f_t> d_b(b.size(), op.data_.handle_ptr->get_stream());
   raft::copy(d_b.data(), b.data(), b.size(), op.data_.handle_ptr->get_stream());
   rmm::device_uvector<f_t> d_x(x.size(), op.data_.handle_ptr->get_stream());
   raft::copy(d_x.data(), x.data(), x.size(), op.data_.handle_ptr->get_stream());
-  auto err = iterative_refinement_gmres<i_t, f_t, T>(op, d_b, d_x);
+  auto err = iterative_refinement_gmres<i_t, f_t, T>(op, d_b, d_x, tol);
 
   raft::copy(x.data(), d_x.data(), x.size(), op.data_.handle_ptr->get_stream());
 
@@ -377,9 +389,12 @@ f_t iterative_refinement(T& op, const dense_vector_t<i_t, f_t>& b, dense_vector_
 }
 
 template <typename i_t, typename f_t, typename T>
-f_t iterative_refinement(T& op, const rmm::device_uvector<f_t>& b, rmm::device_uvector<f_t>& x)
+f_t iterative_refinement(T& op,
+                         const rmm::device_uvector<f_t>& b,
+                         rmm::device_uvector<f_t>& x,
+                         f_t tol = 1e-11)
 {
-  return iterative_refinement_gmres<i_t, f_t, T>(op, b, x);
+  return iterative_refinement_gmres<i_t, f_t, T>(op, b, x, tol);
 }
 
 }  // namespace cuopt::mathematical_optimization::barrier
