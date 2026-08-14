@@ -67,6 +67,9 @@ class local_search_t {
                            const ls_config_t<i_t, f_t>& ls_config);
   bool run_fj_on_zero(solution_t<i_t, f_t>& solution, timer_t timer);
   bool check_fj_on_lp_optimal(solution_t<i_t, f_t>& solution, bool perturb, timer_t timer);
+  // Host-side shifting rounding: rounds integers while repairing violated rows. Returns true only if
+  // the result is feasible; `solution` is overwritten either way.
+  bool run_shifting(solution_t<i_t, f_t>& solution, timer_t timer);
   bool run_staged_fp(solution_t<i_t, f_t>& solution,
                      timer_t timer,
                      population_t<i_t, f_t>* population_ptr);

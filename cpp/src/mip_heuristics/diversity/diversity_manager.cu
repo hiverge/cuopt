@@ -288,6 +288,10 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit, timer_t global_
   raft::common::nvtx::range fun_scope("run_presolve");
   CUOPT_LOG_INFO("\nRunning cuOpt presolve");
   timer_t presolve_timer(time_limit);
+  // The clique graph handed to CPU FJ is indexed by post-presolve variable ids, so any graph left
+  // over from a previous solve is stale. Drop it before presolve reshapes the problem; it is rebuilt
+  // at the end of this function.
+  set_fj_clique_adjacency<i_t, f_t>(nullptr);
 
   auto term_crit = ls.constraint_prop.bounds_update.solve(*problem_ptr);
   if (ls.constraint_prop.bounds_update.infeas_constraints_count > 0) {
@@ -309,7 +313,10 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit, timer_t global_
   }
   if (run_probing_cache) {
     log_presolve_budget("PROBING", probing_features, probing_budget);
-    f_t time_for_probing_cache = std::min(time_limit, (f_t)global_timer.remaining_time());
+    // Hard-cap probing at 8s: on large models the work/step limits alone can let probing eat most of
+    // the presolve budget, starving the clique table and the heuristics that follow.
+    const f_t time_for_probing_cache =
+      std::min({time_limit, static_cast<f_t>(global_timer.remaining_time()), f_t{8}});
     timer_t probing_timer{time_for_probing_cache};
     [[maybe_unused]] const auto probing_t0 = std::chrono::steady_clock::now();
     // this function computes probing cache, finds singletons, substitutions and changes the problem
@@ -328,32 +335,45 @@ bool diversity_manager_t<i_t, f_t>::run_presolve(f_t time_limit, timer_t global_
   problem_ptr->related_vars_time_limit = context.settings.heuristic_params.related_vars_time_limit;
   if (!global_timer.check_time_limit()) { trivial_presolve(*problem_ptr, remap_cache_ids); }
   if (!problem_ptr->empty && !check_bounds_sanity(*problem_ptr)) { return false; }
-  // if (!presolve_timer.check_time_limit() && !context.settings.heuristics_only &&
-  //     !problem_ptr->empty) {
-  //   f_t time_limit_for_clique_table = std::min(3., presolve_timer.remaining_time() / 5);
-  //   timer_t clique_timer(time_limit_for_clique_table);
-  //   simplex::user_problem_t<i_t, f_t> host_problem(problem_ptr->handle_ptr);
-  //   problem_ptr->get_host_user_problem(host_problem);
-  //   std::shared_ptr<clique_table_t<i_t, f_t>> clique_table;
-  //   constexpr bool modify_problem_with_cliques = false;
-  //   find_initial_cliques(host_problem,
-  //                        context.settings.tolerances,
-  //                        &clique_table,
-  //                        clique_timer,
-  //                        modify_problem_with_cliques,
-  //                        nullptr);
-  //   if (modify_problem_with_cliques) {
-  //     problem_ptr->set_constraints_from_host_user_problem(host_problem);
-  //     cuopt_assert(host_problem.lower.size() == static_cast<size_t>(problem_ptr->n_variables),
-  //                  "host lower bound size mismatch");
-  //     cuopt_assert(host_problem.upper.size() == static_cast<size_t>(problem_ptr->n_variables),
-  //                  "host upper bound size mismatch");
-  //     std::vector<i_t> all_var_indices(problem_ptr->n_variables);
-  //     std::iota(all_var_indices.begin(), all_var_indices.end(), 0);
-  //     problem_ptr->update_variable_bounds(all_var_indices, host_problem.lower,
-  //     host_problem.upper); trivial_presolve(*problem_ptr, remap_cache_ids);
-  //   }
-  // }
+  // Build the conflict (clique) graph and publish it for CPU FJ, which uses it to pick partners for
+  // compound binary moves. The problem itself is left untouched here: we only read the cliques.
+  // Materialize only bounded conflict graphs; dense graphs cost more to build than
+  // they save in compound-move selection.
+  if (!problem_ptr->empty && !presolve_timer.check_time_limit() &&
+      !global_timer.check_time_limit()) {
+    const f_t clique_time = std::min({f_t{3},
+                                      static_cast<f_t>(presolve_timer.remaining_time()),
+                                      static_cast<f_t>(global_timer.remaining_time())});
+    timer_t clique_timer(clique_time);
+    simplex::user_problem_t<i_t, f_t> host_problem(problem_ptr->handle_ptr);
+    problem_ptr->get_host_user_problem(host_problem);
+    std::shared_ptr<clique_table_t<i_t, f_t>> table;
+    find_initial_cliques(host_problem, context.settings.tolerances, table, clique_timer);
+
+    constexpr size_t edge_limit = 4'000'000;
+    if (table && !table->empty()) {
+      std::vector<std::pair<i_t, i_t>> edges;
+      bool overflow = false;
+      for (i_t var = 0; var < table->n_variables && !overflow; ++var) {
+        // Adjacency is stored as literals (var and its complement var + n_variables); FJ only needs
+        // the variable index, so fold the polarity away and drop self edges.
+        for (i_t literal : table->get_adj_set_of_var(var)) {
+          const i_t member = literal % table->n_variables;
+          if (member != var) edges.emplace_back(var, member);
+        }
+        // Checked per variable rather than per edge so a single huge adjacency set still bails out.
+        overflow = edges.size() > edge_limit;
+      }
+      if (!overflow && !edges.empty()) {
+        csr_var_map_t<i_t> csr;
+        csr.finalize_from_unsorted_pairs(table->n_variables, edges);
+        auto graph     = std::make_shared<fj_clique_adjacency_t<i_t>>();
+        graph->offsets = std::move(csr.offsets);
+        graph->members = std::move(csr.indices);
+        set_fj_clique_adjacency<i_t, f_t>(std::move(graph));
+      }
+    }
+  }
   // May overconstrain if Papilo presolve has been run before
   if (context.settings.presolver == presolver_t::None) {
     if (!problem_ptr->empty) {
@@ -392,19 +412,21 @@ void diversity_manager_t<i_t, f_t>::generate_quick_feasible_solution()
   ls.generate_fast_solution(solution, sol_timer);
   if (solution.get_feasible()) {
     population.run_solution_callbacks(solution);
-    initial_sol_vector.emplace_back(std::move(solution));
+    // Feed both the raw and the locally searched solution straight into the population instead of
+    // parking them in initial_sol_vector: this function can now be called after the initial
+    // population has already been built, where that vector is no longer consumed.
+    population.add_solution(solution_t<i_t, f_t>(solution));
     problem_ptr->handle_ptr->sync_stream();
-    solution_t<i_t, f_t> searched_sol(initial_sol_vector.back());
-    ls_config_t<i_t, f_t> ls_config;
-    run_local_search(searched_sol, population.weights, sol_timer, ls_config);
-    population.run_solution_callbacks(searched_sol);
-    initial_sol_vector.emplace_back(std::move(searched_sol));
-    auto& feas_sol = initial_sol_vector.back().get_feasible()
-                       ? initial_sol_vector.back()
-                       : initial_sol_vector[initial_sol_vector.size() - 2];
+
+    solution_t<i_t, f_t> searched(solution);
+    ls_config_t<i_t, f_t> config;
+    run_local_search(searched, population.weights, sol_timer, config);
+    population.run_solution_callbacks(searched);
+    population.add_solution(solution_t<i_t, f_t>(searched));
+    auto& best = searched.get_feasible() ? searched : solution;
     CUOPT_LOG_INFO("Generated fast solution in %f seconds with objective %f",
                    timer.elapsed_time(),
-                   feas_sol.get_user_objective());
+                   best.get_user_objective());
   }
   problem_ptr->handle_ptr->sync_stream();
 }
@@ -678,14 +700,43 @@ solution_t<i_t, f_t> diversity_manager_t<i_t, f_t>::run_solver()
   }
 
   if (ls.lp_optimal_exists) {
-    solution_t<i_t, f_t> lp_rounded_sol(*problem_ptr);
-    lp_rounded_sol.copy_new_assignment(lp_optimal_solution);
-    lp_rounded_sol.round_nearest();
-    lp_rounded_sol.compute_feasibility();
-    population.add_solution(std::move(lp_rounded_sol));
+    solution_t<i_t, f_t> rounded(*problem_ptr);
+    rounded.copy_new_assignment(lp_optimal_solution);
+    rounded.round_nearest();
+    rounded.compute_feasibility();
+
+    // Shifting starts from the (unrounded) LP optimum and repairs constraints as it fixes
+    // fractionals, so it often lands on a feasible point where plain nearest-rounding does not.
+    // Cheap enough to always try; only kept if it actually ends up feasible.
+    if (!check_b_b_preemption() && !timer.check_time_limit()) {
+      solution_t<i_t, f_t> shifted(*problem_ptr);
+      shifted.copy_new_assignment(lp_optimal_solution);
+      if (ls.run_shifting(shifted, timer_t(std::min(20., timer.remaining_time())))) {
+        population.run_solution_callbacks(shifted);
+        population.add_solution(std::move(shifted));
+      }
+    }
+
+    population.add_solution(std::move(rounded));
     ls.start_cpufj_lptopt_scratch_threads(population);
+
+    // Feasibility pump is only run on pure binary models: that is where the rounding/projection loop
+    // is cheap and where it complements FJ best. Time-boxed so it cannot dominate the solve.
+    const bool binary_only = problem_ptr->n_integer_vars > 0 &&
+                             problem_ptr->get_n_binary_variables() == problem_ptr->n_integer_vars;
+    if (binary_only && !check_b_b_preemption() && timer.remaining_time() > 1.) {
+      solution_t<i_t, f_t> fp_solution(*problem_ptr);
+      fp_solution.copy_new_assignment(lp_optimal_solution);
+      fp_solution.round_nearest();
+      fp_solution.compute_feasibility();
+      ls.run_fp(fp_solution, timer_t(std::min(15., timer.remaining_time())), &population);
+    }
   }
 
+  if (check_b_b_preemption()) { return population.best_feasible(); }
+  // Last resort before building the population: if nothing above produced a feasible point, spend a
+  // small slice of the budget on the fast-solution path.
+  if (!population.is_feasible() && !timer.check_time_limit()) generate_quick_feasible_solution();
   if (check_b_b_preemption()) { return population.best_feasible(); }
 
   if (context.settings.benchmark_info_ptr != nullptr) {

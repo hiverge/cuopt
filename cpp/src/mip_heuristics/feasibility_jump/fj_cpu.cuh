@@ -10,6 +10,7 @@
 #include <atomic>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <unordered_set>
 #include <vector>
 
@@ -19,6 +20,30 @@
 #include <utilities/producer_sync.hpp>
 
 namespace cuopt::mathematical_optimization::mip {
+
+/**
+ * @brief CSR view of the conflict graph: for each variable, the variables it shares a clique with.
+ *
+ * Used by the CPU FJ compound-move search to pick a second variable to flip that is likely to
+ * compensate for the first one. Built once per presolve, read-only afterwards.
+ */
+template <typename i_t>
+struct fj_clique_adjacency_t {
+  std::vector<int64_t> offsets;
+  std::vector<i_t> members;
+};
+
+// Published by presolve, shared (by const ref) across all CPU FJ climbers of a solve. Set only from
+// the single-threaded presolve path, before any climber is created, and cleared at the start of the
+// next presolve, so the climbers never observe it changing under them.
+template <typename i_t, typename f_t>
+inline std::shared_ptr<const fj_clique_adjacency_t<i_t>> fj_clique_adjacency;
+
+template <typename i_t, typename f_t>
+void set_fj_clique_adjacency(std::shared_ptr<const fj_clique_adjacency_t<i_t>> adjacency)
+{
+  fj_clique_adjacency<i_t, f_t> = std::move(adjacency);
+}
 
 // NOTE: this seems an easy pick for reflection/xmacros once this is available (C++26?)
 // Maintaining a single source of truth for all members would be nice
@@ -176,6 +201,8 @@ struct fj_cpu_climber_t {
   // Precomputed static problem features
   i_t n_binary_vars{0};
   i_t n_integer_vars{0};
+  // Snapshot of fj_clique_adjacency taken at init; null when presolve did not build a graph
+  std::shared_ptr<const fj_clique_adjacency_t<i_t>> clique_adjacency;
   i_t max_var_degree{0};
   i_t max_cstr_degree{0};
   double avg_var_degree{0.0};

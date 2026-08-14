@@ -649,6 +649,183 @@ static inline std::pair<fj_staged_score_t, f_t> compute_score(fj_cpu_climber_t<i
   return std::make_pair(score, base_feas_sum);
 }
 
+// A pair of binary flips applied as one compound move (see find_binary_pair_move)
+struct fj_binary_pair_move_t {
+  fj_move_t first{-1, 0};
+  fj_move_t second{-1, 0};
+  fj_staged_score_t score{fj_staged_score_t::invalid()};
+};
+
+/**
+ * @brief Score the combined effect of flipping two binaries at once.
+ *
+ * Scoring each flip on its own and adding the results would double-count rows that both variables
+ * appear in, and would miss the cases the compound move exists for (the two contributions cancel out
+ * in a shared row). So we gather the per-row LHS deltas of both flips, merge the entries belonging to
+ * the same row, and score every touched row exactly once from its aggregated delta.
+ */
+template <typename i_t, typename f_t>
+static fj_staged_score_t score_binary_pair(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
+                                           i_t first,
+                                           f_t first_delta,
+                                           i_t second,
+                                           f_t second_delta)
+{
+  // (row, coefficient * delta) pairs of both flips; sorted so same-row entries end up adjacent
+  std::vector<std::pair<i_t, f_t>> deltas;
+  auto collect = [&](i_t var, f_t delta) {
+    const auto [begin, end] = reverse_range_for_var<i_t, f_t>(fj_cpu, var);
+    fj_cpu.nnz_processed_window += end - begin;
+    for (i_t p = begin; p < end; ++p) {
+      deltas.emplace_back(fj_cpu.h_reverse_constraints[p],
+                          fj_cpu.h_reverse_coefficients[p] * delta);
+    }
+  };
+  collect(first, first_delta);
+  collect(second, second_delta);
+  std::sort(deltas.begin(), deltas.end());
+
+  f_t feasibility = 0, robustness = 0;
+  for (size_t pos = 0; pos < deltas.size();) {
+    const i_t row = deltas[pos].first;
+    f_t lhs_delta = 0;
+    do {
+      lhs_delta += deltas[pos++].second;
+    } while (pos < deltas.size() && deltas[pos].first == row);
+    // The coefficient is already folded into lhs_delta, hence the unit cstr_coeff below. The var
+    // index is only informational here since the delta may come from either or both variables.
+    const auto [base, robust] = feas_score_constraint<i_t, f_t>(
+      fj_cpu.view,
+      first,
+      lhs_delta,
+      row,
+      f_t{1},
+      fj_cpu.h_cstr_lb[row],
+      fj_cpu.h_cstr_ub[row],
+      fj_cpu.h_lhs[row],
+      fj_cpu.h_cstr_left_weights[row],
+      fj_cpu.h_cstr_right_weights[row]);
+    feasibility += base;
+    robustness += robust;
+  }
+
+  const f_t objective_delta = fj_cpu.h_obj_coeffs[first] * first_delta +
+                              fj_cpu.h_obj_coeffs[second] * second_delta;
+  const f_t objective_score = objective_delta < 0   ? fj_cpu.h_objective_weight
+                                : objective_delta > 0 ? -fj_cpu.h_objective_weight
+                                                      : 0;
+  // Same staged-score convention as the single-variable path: objective direction and feasibility
+  // gain in the base score, incumbent-vs-best crossing and robustness in the bonus
+  const bool old_breakthrough = fj_cpu.h_incumbent_objective < fj_cpu.h_best_objective;
+  const bool new_breakthrough =
+    fj_cpu.h_incumbent_objective + objective_delta < fj_cpu.h_best_objective;
+  const f_t breakthrough = !old_breakthrough && new_breakthrough   ? fj_cpu.h_objective_weight
+                           : old_breakthrough && !new_breakthrough ? -fj_cpu.h_objective_weight
+                                                                   : 0;
+  return {static_cast<float>(round(objective_score + feasibility)),
+          static_cast<float>(round(breakthrough + robustness))};
+}
+
+/**
+ * @brief Look for an improving simultaneous flip of two binaries.
+ *
+ * At a local minimum no single flip improves the score, but a pair often does: in set-partitioning
+ * style rows the only way out is to turn one variable off and another on in the same step. This
+ * searches a sampled neighbourhood rather than all pairs, which would be quadratic:
+ *  - first variables come from a few violated rows (or, when nothing is violated, from
+ *    objective variables whose flip would improve the objective),
+ *  - partners come from the clique graph when presolve built one, otherwise from the rows the first
+ *    variable appears in,
+ *  - the whole search is capped at max_evals pair evaluations.
+ * Returns an invalid-scored move when no pair was worth applying.
+ */
+template <typename i_t, typename f_t>
+static fj_binary_pair_move_t find_binary_pair_move(fj_cpu_climber_t<i_t, f_t>& fj_cpu)
+{
+  constexpr size_t max_targets = 8;      // violated rows sampled for candidate first variables
+  constexpr size_t max_starts  = 64;     // objective variables sampled when nothing is violated
+  constexpr size_t max_evals   = 12000;  // budget on pair scorings, this runs on every local minimum
+  // Seeded per iteration so climbers stay reproducible while still sampling differently over time
+  std::mt19937 rng(fj_cpu.settings.seed + fj_cpu.iterations);
+  std::vector<i_t> first_vars;
+  std::vector<bool> seen(fj_cpu.view.pb.n_variables, false);
+
+  if (!fj_cpu.violated_constraints.empty()) {
+    std::vector<i_t> targets;
+    std::sample(fj_cpu.violated_constraints.begin(),
+                fj_cpu.violated_constraints.end(),
+                std::back_inserter(targets),
+                max_targets,
+                rng);
+    for (i_t row : targets) {
+      const auto [begin, end] = range_for_constraint<i_t, f_t>(fj_cpu, row);
+      for (i_t p = begin; p < end; ++p) {
+        const i_t var = fj_cpu.h_variables[p];
+        if (fj_cpu.h_is_binary_variable[var] && !seen[var]) {
+          seen[var] = true;
+          first_vars.push_back(var);
+        }
+      }
+    }
+  } else {
+    std::vector<i_t> starts;
+    std::sample(fj_cpu.h_objective_vars.begin(),
+                fj_cpu.h_objective_vars.end(),
+                std::back_inserter(starts),
+                max_starts,
+                rng);
+    // Feasible incumbent: the pair move can only help by improving the objective, so restrict the
+    // starts to flips that move the objective down and let the pair scoring pay for the feasibility
+    // damage.
+    for (i_t var : starts) {
+      if (!fj_cpu.h_is_binary_variable[var]) continue;
+      const f_t delta = 1 - 2 * fj_cpu.h_assignment[var].get();
+      if (fj_cpu.h_obj_coeffs[var] * delta < 0) first_vars.push_back(var);
+    }
+  }
+  std::shuffle(first_vars.begin(), first_vars.end(), rng);
+
+  fj_binary_pair_move_t best;
+  size_t evaluations = 0;
+  for (i_t first : first_vars) {
+    const f_t first_delta = round(1 - 2 * fj_cpu.h_assignment[first].get());
+    if (tabu_check<i_t, f_t>(fj_cpu, first, first_delta, true)) continue;
+
+    // Preferred partners: variables in conflict with `first`, since flipping one of those is what
+    // typically restores the row `first` just broke.
+    std::vector<i_t> partners;
+    if (fj_cpu.clique_adjacency &&
+        static_cast<size_t>(first + 1) < fj_cpu.clique_adjacency->offsets.size()) {
+      const auto& graph = *fj_cpu.clique_adjacency;
+      for (auto p = graph.offsets[first]; p < graph.offsets[first + 1]; ++p) {
+        partners.push_back(graph.members[p]);
+      }
+    }
+    // No clique graph (or `first` has no conflicts): fall back to the variables sharing a row
+    if (partners.empty()) {
+      const auto [begin, end] = reverse_range_for_var<i_t, f_t>(fj_cpu, first);
+      for (i_t p = begin; p < end; ++p) {
+        const auto [row_begin, row_end] =
+          range_for_constraint<i_t, f_t>(fj_cpu, fj_cpu.h_reverse_constraints[p]);
+        for (i_t q = row_begin; q < row_end; ++q) partners.push_back(fj_cpu.h_variables[q]);
+      }
+    }
+    std::sort(partners.begin(), partners.end());
+    partners.erase(std::unique(partners.begin(), partners.end()), partners.end());
+    std::shuffle(partners.begin(), partners.end(), rng);
+
+    for (i_t second : partners) {
+      if (second == first || !fj_cpu.h_is_binary_variable[second]) continue;
+      const f_t second_delta = round(1 - 2 * fj_cpu.h_assignment[second].get());
+      if (tabu_check<i_t, f_t>(fj_cpu, second, second_delta, true)) continue;
+      const auto score = score_binary_pair(fj_cpu, first, first_delta, second, second_delta);
+      if (best.score < score) best = {{first, first_delta}, {second, second_delta}, score};
+      if (++evaluations == max_evals) return best;
+    }
+  }
+  return best;
+}
+
 template <typename i_t, typename f_t>
 static void smooth_weights(fj_cpu_climber_t<i_t, f_t>& fj_cpu)
 {
@@ -1272,6 +1449,8 @@ static void init_fj_cpu(fj_cpu_climber_t<i_t, f_t>& fj_cpu,
   fj_cpu.h_is_binary_variable =
     cuopt::host_copy(problem.is_binary_variable, handle_ptr->get_stream());
   fj_cpu.h_binary_indices = cuopt::host_copy(problem.binary_indices, handle_ptr->get_stream());
+  // Shared, read-only copy of the conflict graph presolve published (null if it built none)
+  fj_cpu.clique_adjacency = fj_clique_adjacency<i_t, f_t>;
 
   fj_cpu.h_cstr_left_weights  = left_weights;
   fj_cpu.h_cstr_right_weights = right_weights;
@@ -1684,20 +1863,33 @@ void cpufj_solve(fj_cpu_climber_t<i_t, f_t>* fj_cpu, f_t in_time_limit, double w
       if (is_mtm_viol) fj_cpu->n_mtm_viol_moves_window++;
       if (is_mtm_sat) fj_cpu->n_mtm_sat_moves_window++;
     } else {
-      // Local Min
-      update_weights(*fj_cpu);
-      if (should_perturb) {
-        perturb(*fj_cpu);
-        for (size_t i = 0; i < fj_cpu->cached_mtm_moves.size(); i++)
-          fj_cpu->cached_mtm_moves[i].first = 0;
+      // Local minimum. Before giving up on the current weights, try a compound two-binary flip: it
+      // escapes minima that no single flip can, and unlike a weight update or a perturbation it keeps
+      // the search on a strictly improving path. Skipped when we are about to perturb anyway.
+      fj_binary_pair_move_t pair;
+      if (!should_perturb) pair = find_binary_pair_move(*fj_cpu);
+      if (pair.score > fj_staged_score_t::zero()) {
+        // Applied as two separate moves; the pair was scored jointly, so the intermediate state after
+        // the first flip may well be worse than the local minimum we came from
+        apply_move(*fj_cpu, pair.first.var_idx, pair.first.value, true);
+        apply_move(*fj_cpu, pair.second.var_idx, pair.second.value, true);
+        fj_cpu->n_mtm_viol_moves_window += 2;
+      } else {
+        // No usable pair: original behaviour, bump the constraint weights (and perturb if due), then
+        // take a random move on a violated constraint
+        update_weights(*fj_cpu);
+        if (should_perturb) {
+          perturb(*fj_cpu);
+          for (auto& cached : fj_cpu->cached_mtm_moves)
+            cached.first = 0;
+        }
+        thrust::tie(move, score) = find_mtm_move_viol(*fj_cpu, 1, true);
+        const i_t var_idx = move.var_idx >= 0 ? move.var_idx : 0;
+        const f_t delta   = move.var_idx >= 0 ? move.value : 0;
+        apply_move(*fj_cpu, var_idx, delta, true);
+        ++local_mins;
+        ++fj_cpu->n_local_minima_window;
       }
-      thrust::tie(move, score) =
-        find_mtm_move_viol(*fj_cpu, 1, true);  // pick a single random violated constraint
-      i_t var_idx = move.var_idx >= 0 ? move.var_idx : 0;
-      f_t delta   = move.var_idx >= 0 ? move.value : 0;
-      apply_move(*fj_cpu, var_idx, delta, true);
-      ++local_mins;
-      ++fj_cpu->n_local_minima_window;
     }
 
     // number of violated constraints is usually small (<100). recomputing from all LHSs is cheap

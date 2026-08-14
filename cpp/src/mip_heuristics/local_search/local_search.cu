@@ -20,6 +20,11 @@
 
 #include <mip_heuristics/feasibility_jump/fj_cpu.cuh>
 
+#include <algorithm>
+#include <cmath>
+#include <utility>
+#include <vector>
+
 namespace cuopt::mathematical_optimization::mip {
 
 template <typename i_t, typename f_t>
@@ -44,7 +49,10 @@ local_search_t<i_t, f_t>::local_search_t(mip_solver_context_t<i_t, f_t>& context
 {
   const int n_cpufj = context.settings.heuristic_params.num_cpufj_threads;
   ls_cpu_fj.resize(n_cpufj);
-  scratch_cpu_fj.resize(1);
+  // Run a few scratch climbers instead of a single one: they are randomized, so more of them means
+  // more independent chances of hitting a first feasible solution. Kept small (and bounded by the
+  // configured thread count) so they do not starve the rest of the heuristics.
+  scratch_cpu_fj.resize(std::clamp(n_cpufj, 2, 4));
   fj.settings.n_of_minimums_for_exit = context.settings.heuristic_params.n_of_minimums_for_exit;
 }
 
@@ -63,34 +71,33 @@ void local_search_t<i_t, f_t>::start_cpufj_scratch_threads(population_t<i_t, f_t
                solution.assignment.end(),
                0.0);
   solution.clamp_within_bounds();
-  i_t counter = 0;
-  for (auto& cpu_fj : scratch_cpu_fj) {
-    if (counter > 0) solution.assign_random_within_bounds(0.4);
-    cpu_fj = fj.create_cpu_climber(solution,
-                                   default_weights,
-                                   default_weights,
-                                   0.,
-                                   context.preempt_heuristic_solver_,
-                                   fj_settings_t{},
-                                   /*randomize=*/counter > 0);
-
-    cpu_fj->log_prefix = "******* scratch " + std::to_string(counter) + ": ";
-    cpu_fj->improvement_callback =
+  // All climbers start from the same clamped all-zero point and get their diversity from the
+  // randomize flag, rather than from randomized starting assignments: starting from zero is a much
+  // better base for the FJ weights, and the randomized climbers diverge quickly anyway.
+  for (size_t i = 0; i < scratch_cpu_fj.size(); ++i) {
+    auto& climber = scratch_cpu_fj[i];
+    climber       = fj.create_cpu_climber(solution,
+                                    default_weights,
+                                    default_weights,
+                                    0.,
+                                    context.preempt_heuristic_solver_,
+                                    fj_settings_t{},
+                                    true);
+    climber->log_prefix = "******* scratch " + std::to_string(i) + ": ";
+    climber->improvement_callback =
       [this, &population, problem_ptr = context.problem_ptr](
-        f_t obj, const std::vector<f_t>& h_vec, double /*work_units*/) {
-        population.add_external_solution(h_vec, obj, solution_origin_t::CPUFJ);
-        (void)problem_ptr;
-        if (obj < this->local_search_best_obj) {
+        f_t obj, const std::vector<f_t>& assignment, double /*work_units*/) {
+        population.add_external_solution(assignment, obj, solution_origin_t::CPUFJ);
+        if (obj < local_search_best_obj) {
           CUOPT_LOG_TRACE("******* New local search best obj %g, best overall %g",
                           problem_ptr->get_user_obj_from_solver_obj(obj),
                           problem_ptr->get_user_obj_from_solver_obj(
                             population.is_feasible() ? population.best_feasible().get_objective()
                                                      : std::numeric_limits<f_t>::max()));
-          this->local_search_best_obj = obj;
+          local_search_best_obj = obj;
         }
       };
-    counter++;
-  };
+  }
 
   CUOPT_LOG_DEBUG("Launching %d scratch CPUFJ tasks", scratch_cpu_fj.size());
 
@@ -145,9 +152,14 @@ void local_search_t<i_t, f_t>::stop_cpufj_scratch_threads()
 {
   if (omp_get_num_threads() < CUOPT_MIP_FJ_REQUIRED_THREAD_COUNT) return;
 
-  for (size_t i = 0; i < scratch_cpu_fj.size(); ++i) {
-    scratch_cpu_fj[i]->halted = true;
-#pragma omp taskwait depend(in : *scratch_cpu_fj[i])  // Wait for each scratch CPU FJ task to finish
+  // Signal every climber first, then wait: waiting on one at a time would let the others keep
+  // running for the duration of each wait. The null check covers the case where the scratch threads
+  // were never started (or were started before the climbers were created).
+  for (auto& climber : scratch_cpu_fj)
+    if (climber) climber->halted = true;
+  for (auto& climber : scratch_cpu_fj) {
+    if (!climber) continue;
+#pragma omp taskwait depend(in : *climber)
   }
 
   if (scratch_cpu_fj_on_lp_opt) {
@@ -519,6 +531,181 @@ bool local_search_t<i_t, f_t>::check_fj_on_lp_optimal(solution_t<i_t, f_t>& solu
   f_t time_limit                     = std::min(30., timer.remaining_time());
   do_fj_solve(solution, fj, time_limit, "on_lp_optimal");
   return solution.get_feasible();
+}
+
+/**
+ * @brief Shifting rounding heuristic: round the integers of `solution` one at a time and repair the
+ *        constraints that break along the way.
+ *
+ * Unlike plain rounding, a violated row is not left violated: the loop alternates between fixing the
+ * next fractional integer and shifting some variable to repair a violated row. Runs entirely on the
+ * host on a copy of the assignment (the working set is small and the access pattern is irregular),
+ * writes the result back and reports whether it ended up feasible. On failure `solution` still holds
+ * the partially shifted point, so callers must check the return value before keeping it.
+ */
+template <typename i_t, typename f_t>
+bool local_search_t<i_t, f_t>::run_shifting(solution_t<i_t, f_t>& solution, timer_t timer)
+{
+  namespace simplex = cuopt::mathematical_optimization::simplex;
+  auto* problem      = solution.problem_ptr;
+  if (problem->n_integer_vars == 0 || timer.check_time_limit()) return false;
+
+  simplex::user_problem_t<i_t, f_t> host(problem->handle_ptr);
+  problem->get_host_user_problem(host);
+  auto x = host_copy(solution.assignment, problem->handle_ptr->get_stream());
+  // Guard against a problem/solution size mismatch (e.g. presolve resized in between)
+  if (x.size() != static_cast<size_t>(host.num_cols)) return false;
+
+  // The host problem stores rows as sense + rhs; convert to explicit [lb, ub] ranges
+  const f_t inf = std::numeric_limits<f_t>::infinity();
+  const f_t tol = std::max<f_t>(problem->tolerances.absolute_tolerance, 1e-7);
+  std::vector<f_t> row_lb(host.num_rows, -inf), row_ub(host.num_rows, inf);
+  for (i_t row = 0; row < host.num_rows; ++row) {
+    const char sense = host.row_sense.empty() ? 'E' : host.row_sense[row];
+    if (sense == 'E') row_lb[row] = row_ub[row] = host.rhs[row];
+    else if (sense == 'L') row_ub[row] = host.rhs[row];
+    else row_lb[row] = host.rhs[row];
+  }
+
+  // Single pass over the column-major matrix builds everything the loop below needs: a row-major view
+  // (to pick repair candidates), the row activities (kept incrementally up to date afterwards), and
+  // the variable locks. up_locks[col] counts the rows that increasing col could push out of its
+  // range, down_locks[col] the same for decreasing it; a variable with few locks in one direction is
+  // a cheap one to move that way.
+  std::vector<std::vector<std::pair<i_t, f_t>>> rows(host.num_rows);
+  std::vector<f_t> activity(host.num_rows, 0);
+  std::vector<i_t> up_locks(host.num_cols, 0), down_locks(host.num_cols, 0);
+  for (i_t col = 0; col < host.num_cols; ++col) {
+    x[col] = std::clamp(x[col], host.lower[col], host.upper[col]);
+    for (i_t p = host.A.col_start[col]; p < host.A.col_start[col + 1]; ++p) {
+      const i_t row = host.A.i[p];
+      const f_t a   = host.A.x[p];
+      rows[row].emplace_back(col, a);
+      activity[row] += a * x[col];
+      up_locks[col] += (a > 0 && std::isfinite(row_ub[row])) ||
+                       (a < 0 && std::isfinite(row_lb[row]));
+      down_locks[col] += (a > 0 && std::isfinite(row_lb[row])) ||
+                         (a < 0 && std::isfinite(row_ub[row]));
+    }
+  }
+
+  std::vector<unsigned char> fractional(host.num_cols, 0), queued(host.num_rows, 0);
+  std::vector<i_t> order;
+  for (i_t col = 0; col < host.num_cols; ++col) {
+    if (host.var_types[col] != simplex::variable_type_t::CONTINUOUS &&
+        std::abs(x[col] - std::round(x[col])) > problem->tolerances.integrality_tolerance) {
+      fractional[col] = 1;
+      order.push_back(col);
+    }
+  }
+  // Round the most constrained variables first: they have the fewest safe values left, so deciding
+  // them while the rest of the assignment is still flexible gives the repair step more room.
+  std::stable_sort(order.begin(), order.end(), [&](i_t a, i_t b) {
+    return std::max(up_locks[a], down_locks[a]) > std::max(up_locks[b], down_locks[b]);
+  });
+
+  auto violation = [&](i_t row) {
+    return std::max<f_t>({0, row_lb[row] - activity[row], activity[row] - row_ub[row]});
+  };
+  // Worklist of violated rows. `queued` keeps it duplicate-free; entries may still go stale (a later
+  // move can repair a queued row), so consumers re-check the violation before acting on one.
+  std::vector<i_t> bad_rows;
+  auto enqueue = [&](i_t row) {
+    if (!queued[row] && violation(row) > tol) {
+      queued[row] = 1;
+      bad_rows.push_back(row);
+    }
+  };
+  for (i_t row = 0; row < host.num_rows; ++row) enqueue(row);
+
+  // Set col to value (clamped to its bounds), updating the activities of the rows it appears in.
+  // Returns false when the move was a no-op, which the caller counts as a stall.
+  auto move = [&](i_t col, f_t value) {
+    value           = std::clamp(value, host.lower[col], host.upper[col]);
+    const f_t delta = value - x[col];
+    if (std::abs(delta) <= tol) return false;
+    x[col] = value;
+    for (i_t p = host.A.col_start[col]; p < host.A.col_start[col + 1]; ++p) {
+      const i_t row = host.A.i[p];
+      activity[row] += host.A.x[p] * delta;
+      enqueue(row);
+    }
+    return true;
+  };
+
+  // Repairing violations takes priority over rounding, so the step count has to allow for more than
+  // one step per integer; bail out early if we make no progress for a few consecutive steps.
+  size_t order_pos    = 0;
+  i_t stalled         = 0;
+  const i_t max_steps = std::max<i_t>(problem->n_integer_vars + 6, 32);
+  for (i_t step = 0; step < max_steps && stalled <= 5 && !timer.check_time_limit(); ++step) {
+    // Pop the next still-violated row, if any
+    i_t row = -1;
+    while (!bad_rows.empty()) {
+      const i_t candidate = bad_rows.back();
+      bad_rows.pop_back();
+      queued[candidate] = 0;
+      if (violation(candidate) > tol) { row = candidate; break; }
+    }
+    // Nothing violated: round the next fractional integer (skipping the ones a repair step already
+    // rounded). When there are none left the assignment is integral and feasible, so stop.
+    if (row < 0) {
+      while (order_pos < order.size() && !fractional[order[order_pos]]) ++order_pos;
+      if (order_pos == order.size()) break;
+      const i_t col   = order[order_pos++];
+      fractional[col] = 0;
+      // Round away from the more locked direction, i.e. towards the side that breaks fewer rows
+      const f_t value = up_locks[col] >= down_locks[col] ? std::floor(x[col] + tol)
+                                                        : std::ceil(x[col] - tol);
+      stalled         = move(col, value) ? 0 : stalled + 1;
+      continue;
+    }
+
+    // Repair `row`: pick the variable whose shift in the required direction hurts least
+    const bool need_up = activity[row] < row_lb[row];
+    f_t best_score = inf, best_coef = 0;
+    i_t best_col = -1;
+    int best_dir = 0;
+    for (const auto [col, a] : rows[row]) {
+      const int dir = ((need_up && a > 0) || (!need_up && a < 0)) ? 1 : -1;
+      // Already at the bound we would need to move past
+      if ((dir > 0 && x[col] >= host.upper[col] - tol) ||
+          (dir < 0 && x[col] <= host.lower[col] + tol)) continue;
+      // Lower is better. Still-fractional integers score below zero, so repairing a row by rounding
+      // one of them (which we have to do anyway) always beats disturbing a settled variable; among
+      // those, prefer the one with fewer locks in the direction we are moving. Everything else is
+      // scored by its objective deterioration, with a penalty that favours continuous variables.
+      f_t score = fractional[col]
+                    ? -1 + f_t{1} / (f_t{1} + (dir > 0 ? down_locks[col] : up_locks[col]))
+                    : dir * host.objective[col] +
+                        (host.var_types[col] != simplex::variable_type_t::CONTINUOUS);
+      if (score < best_score) {
+        best_score = score; best_col = col; best_dir = dir; best_coef = a;
+      }
+    }
+    if (best_col < 0) { ++stalled; continue; }
+
+    // How far to shift: rounding to the next integer in the repair direction, a unit step for an
+    // already integral integer, or exactly enough to close the violation for a continuous variable
+    f_t value;
+    if (fractional[best_col]) {
+      value                = best_dir > 0 ? std::ceil(x[best_col] - tol) : std::floor(x[best_col] + tol);
+      fractional[best_col] = 0;
+    } else if (host.var_types[best_col] != simplex::variable_type_t::CONTINUOUS) {
+      value = x[best_col] + best_dir;
+    } else {
+      value = x[best_col] + best_dir * violation(row) / std::abs(best_coef);
+    }
+    stalled = move(best_col, value) ? 0 : stalled + 1;
+    // A single step may not be enough (bounds clamping, integer steps), so requeue if still violated
+    enqueue(row);
+  }
+
+  // Push the shifted point back to the device and let the solution decide on feasibility: the loop
+  // above may have run out of steps or time with violations left.
+  raft::copy(solution.assignment.data(), x.data(), x.size(), problem->handle_ptr->get_stream());
+  solution.clamp_within_bounds();
+  return solution.compute_feasibility();
 }
 
 template <typename i_t, typename f_t>
