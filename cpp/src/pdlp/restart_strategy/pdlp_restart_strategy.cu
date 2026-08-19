@@ -1094,6 +1094,8 @@ void pdlp_restart_strategy_t<i_t, f_t>::cupdlpx_restart(
   // TODO later batch mode: remove if you have per climber restart
   for (size_t i = 0; i < climber_strategies_.size(); ++i) {
     weighted_average_solution_.iterations_since_last_restart_ = 0;
+    // Reset the epoch-ergodic average when restarting
+    weighted_average_solution_.reset_weighted_average_solution();
     last_trial_fixed_point_error_[i] = std::numeric_limits<f_t>::infinity();
   }
 
@@ -1101,6 +1103,8 @@ void pdlp_restart_strategy_t<i_t, f_t>::cupdlpx_restart(
     engine->for_each_shard([&](auto& shard) {
       shard.sub_pdlp->get_restart_strategy()
         .weighted_average_solution_.iterations_since_last_restart_ = 0;
+      shard.sub_pdlp->get_restart_strategy()
+        .weighted_average_solution_.reset_weighted_average_solution();
     });
   }
 }

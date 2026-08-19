@@ -233,6 +233,8 @@ static void set_Stable3(pdlp::pdlp_hyper_params_t& hyper_params)
   hyper_params.use_reflected_primal_dual             = true;
   hyper_params.use_fixed_point_error                 = true;
   hyper_params.use_conditional_major                 = true;
+  // Enable evaluation of ergodic (averaged) iterate as second termination candidate
+  hyper_params.evaluate_average_candidate            = true;
 }
 
 // Legacy/Original/Initial PDLP settings

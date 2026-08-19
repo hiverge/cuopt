@@ -29,6 +29,11 @@ struct pdlp_hyper_params_t {
   int min_iteration_restart                         = 0;
   int restart_strategy                              = 3;
   bool never_restart_to_average                     = true;
+  // If true, evaluate ergodic (averaged) iterate as a second termination candidate
+  // alongside the current iterate, even when never_restart_to_average is true.
+  // Restarts still anchor at T(z^{n,τ}) and never at the average; this flag only
+  // enables reading and evaluating the average for termination purposes.
+  bool evaluate_average_candidate                   = false;
 
   double reduction_exponent               = 0.3;
   double growth_exponent                  = 0.6;

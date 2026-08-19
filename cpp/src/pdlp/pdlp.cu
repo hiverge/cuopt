@@ -248,8 +248,8 @@ pdlp_solver_t<i_t, f_t>::pdlp_solver_t(mip::problem_t<i_t, f_t>& op_problem,
       op_problem_scaled_,
       average_op_problem_evaluation_cusparse_view_,
       pdhg_solver_.get_cusparse_view(),
-      settings_.hyper_params.never_restart_to_average ? 0 : primal_size_h_,
-      settings_.hyper_params.never_restart_to_average ? 0 : dual_size_h_,
+      (settings_.hyper_params.never_restart_to_average && !settings_.hyper_params.evaluate_average_candidate) ? 0 : primal_size_h_,
+      (settings_.hyper_params.never_restart_to_average && !settings_.hyper_params.evaluate_average_candidate) ? 0 : dual_size_h_,
       initial_scaling_strategy_,
       settings_,
       climber_strategies_},
@@ -1155,7 +1155,7 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
 #endif
 
   // Check both average and current solution
-  if (!settings_.hyper_params.never_restart_to_average) {
+  if (!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) {
     average_termination_strategy_.evaluate_termination_criteria(
       pdhg_solver_,
       unscaled_primal_avg_solution_,
@@ -1171,7 +1171,7 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
   }
 
 #ifdef PDLP_VERBOSE_MODE
-  if (!settings_.hyper_params.never_restart_to_average) {
+  if (!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) {
     RAFT_CUDA_TRY(cudaDeviceSynchronize());
     std::cout << "Termination criteria average:" << std::endl;
     print_termination_criteria(timer, true);
@@ -1207,7 +1207,7 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
                      info.get_relative_l2_dual_residual_value());
     };
     print_hive_tolerance_trace("current", current_termination_strategy_);
-    if (!settings_.hyper_params.never_restart_to_average) {
+    if (!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) {
       print_hive_tolerance_trace("average", average_termination_strategy_);
     }
   }
@@ -1224,7 +1224,7 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
   // First check for pdlp_termination_reason_t::Optimality and handle the first primal feasible case
 
   if (settings_.first_primal_feasible) {
-    if (!settings_.hyper_params.never_restart_to_average &&
+    if ((!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) &&
         termination_average == pdlp_termination_status_t::PrimalFeasible &&
         termination_current == pdlp_termination_status_t::PrimalFeasible) {
       // Both primal feasible, return the one with the best overall residual
@@ -1270,7 +1270,7 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
           : pdhg_solver_.get_potential_next_dual_solution(),
         get_filled_warmed_start_data(),
         {termination_current});
-    } else if (!settings_.hyper_params.never_restart_to_average &&
+    } else if ((!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) &&
                termination_average == pdlp_termination_status_t::PrimalFeasible) {
       return average_termination_strategy_.fill_return_problem_solution(
         internal_solver_iterations_,
@@ -1284,7 +1284,8 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
   }
 
   // If both are pdlp_termination_status_t::Optimal, return the one with the lowest KKT score
-  if (average_termination_strategy_.all_optimal_status() &&
+  if ((!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) &&
+      average_termination_strategy_.all_optimal_status() &&
       current_termination_strategy_.all_optimal_status()) {
     cuopt_assert(!batch_mode_,
                  "Should never have both current and average optimal in batch mode (since using "
@@ -1339,7 +1340,8 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
   }
 
   // If at least one is pdlp_termination_status_t::Optimal, return it
-  if (average_termination_strategy_.all_optimal_status()) {
+  if ((!settings_.hyper_params.never_restart_to_average || settings_.hyper_params.evaluate_average_candidate) &&
+      average_termination_strategy_.all_optimal_status()) {
     cuopt_assert(!batch_mode_,
                  "Should never have average optimal in batch mode (since using PDLP+ algorithm)");
 #ifdef PDLP_VERBOSE_MODE
@@ -1384,7 +1386,8 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
   // Else both are needed (unless there is no average)
   // (If infeasibility_detection is not set, termination reason cannot be Infeasible)
   if (settings_.detect_infeasibility) {
-    if (settings_.strict_infeasibility || settings_.hyper_params.never_restart_to_average) {
+    if (settings_.strict_infeasibility || 
+        (settings_.hyper_params.never_restart_to_average && !settings_.hyper_params.evaluate_average_candidate)) {
       if (termination_current == pdlp_termination_status_t::PrimalInfeasible ||
           termination_current == pdlp_termination_status_t::DualInfeasible) {
 #ifdef PDLP_VERBOSE_MODE
@@ -3228,6 +3231,17 @@ void pdlp_solver_t<i_t, f_t>::take_constant_step(bool is_major_iteration)
     false,
     total_pdlp_iterations_,
     is_major_iteration);
+
+  // If evaluate_average_candidate is enabled and we're not in batch/distributed mode,
+  // accumulate the proximal pair into the epoch-ergodic average (scaled space)
+  if (settings_.hyper_params.evaluate_average_candidate && !batch_mode_ && 
+      !is_distributed_master()) {
+    restart_strategy_.add_current_solution_to_average_solution(
+      pdhg_solver_.get_potential_next_primal_solution().data(),
+      pdhg_solver_.get_potential_next_dual_solution().data(),
+      step_size_,
+      total_pdlp_iterations_);
+  }
 }
 
 template <typename i_t, typename f_t>
