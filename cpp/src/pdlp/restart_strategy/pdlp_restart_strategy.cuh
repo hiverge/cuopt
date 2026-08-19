@@ -28,6 +28,8 @@
 
 #include <raft/core/device_span.hpp>
 
+#include <limits>
+
 namespace cuopt::mathematical_optimization::pdlp {
 template <typename i_t, typename f_t>
 class pdlp_restart_strategy_t {
@@ -392,6 +394,14 @@ class pdlp_restart_strategy_t {
   thrust::universal_host_pinned_vector<f_t> primal_weight_error_sum_;
   thrust::universal_host_pinned_vector<f_t> primal_weight_last_error_;
   thrust::universal_host_pinned_vector<f_t> best_primal_dual_residual_gap_;
+
+  // Best-KKT checkpoint mechanism with hysteresis
+  // Store the best KKT checkpoint found so far and its merit
+  rmm::device_uvector<f_t> best_kkt_checkpoint_primal_;
+  rmm::device_uvector<f_t> best_kkt_checkpoint_dual_;
+  f_t best_kkt_merit_{std::numeric_limits<f_t>::max()};
+  // Hysteresis margin: restart to new candidate only if merit doesn't degrade by >2x
+  static constexpr f_t kkt_hysteresis_margin_ = f_t(2.0);
 
   const std::vector<pdlp_climber_strategy_t>& climber_strategies_;
   const pdlp::pdlp_hyper_params_t& hyper_params_;

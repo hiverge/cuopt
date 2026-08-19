@@ -205,6 +205,8 @@ pdlp_restart_strategy_t<i_t, f_t>::pdlp_restart_strategy_t(
     primal_weight_error_sum_(climber_strategies.size()),
     primal_weight_last_error_(climber_strategies.size()),
     best_primal_dual_residual_gap_(climber_strategies.size()),
+    best_kkt_checkpoint_primal_(primal_size, stream_view_),
+    best_kkt_checkpoint_dual_(dual_size, stream_view_),
     climber_strategies_(climber_strategies),
     hyper_params_(hyper_params)
 {
@@ -591,46 +593,95 @@ bool pdlp_restart_strategy_t<i_t, f_t>::run_kkt_restart(
   if (kkt_restart_conditions(candidate_kkt_score, total_number_of_iterations)) {
     has_restarted = true;
 
-    // If restart, need to compute distance travaled from last either from current or average
-    // This is necessary to compute the new primal weight
-
-#ifdef PDLP_DEBUG_MODE
-    RAFT_CUDA_TRY(cudaDeviceSynchronize());
-    std::cout << "  Doing KKT restart" << std::endl;
-#endif
-
-    // Set which localized_duality_gap_container will be used for candidate
-    // (We could save the container copy but compute_distance_traveled_from_last_restart works with
-    // containers)
-    if (restart_to_average && !hyper_params_.never_restart_to_average) {
+    // Check best-KKT checkpoint hysteresis: only restart if merit doesn't degrade by >2x
+    if (best_kkt_merit_ < std::numeric_limits<f_t>::max() && 
+        candidate_kkt_score > best_kkt_merit_ * kkt_hysteresis_margin_) {
+      // Merit degraded too much; restore from best-KKT checkpoint instead
 #ifdef PDLP_DEBUG_MODE
       RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      std::cout << "    KKT restart to average" << std::endl;
+      std::cout << "    Hysteresis triggered: restoring best-KKT checkpoint instead of new candidate\n"
+                << "    best_kkt_merit_=" << best_kkt_merit_ << " candidate_kkt_score=" << candidate_kkt_score
+                << " ratio=" << (candidate_kkt_score / best_kkt_merit_) << std::endl;
 #endif
-
-      raft::copy(avg_duality_gap_.primal_solution_.data(),
-                 primal_solution_avg.data(),
+      // Restore from best-KKT checkpoint
+      raft::copy(pdhg_solver.get_primal_solution().data(),
+                 best_kkt_checkpoint_primal_.data(),
                  primal_size_h_,
                  stream_view_);
-      raft::copy(avg_duality_gap_.dual_solution_.data(),
-                 dual_solution_avg.data(),
+      raft::copy(pdhg_solver.get_dual_solution().data(),
+                 best_kkt_checkpoint_dual_.data(),
                  dual_size_h_,
                  stream_view_);
-      candidate_duality_gap_ = &avg_duality_gap_;
-    } else {
-#ifdef PDLP_DEBUG_MODE
-      RAFT_CUDA_TRY(cudaDeviceSynchronize());
-      std::cout << "    KKT no restart to average" << std::endl;
-#endif
+      set_last_restart_was_average(false);
+      
+      // Prepare for distance computation using restored checkpoint
       raft::copy(current_duality_gap_.primal_solution_.data(),
-                 pdhg_solver.get_saddle_point_state().get_primal_solution().data(),
+                 best_kkt_checkpoint_primal_.data(),
                  primal_size_h_,
                  stream_view_);
       raft::copy(current_duality_gap_.dual_solution_.data(),
-                 pdhg_solver.get_saddle_point_state().get_dual_solution().data(),
+                 best_kkt_checkpoint_dual_.data(),
                  dual_size_h_,
                  stream_view_);
       candidate_duality_gap_ = &current_duality_gap_;
+      candidate_kkt_score = best_kkt_merit_;  // Use the restored checkpoint's merit
+    } else {
+      // Normal restart logic: apply hysteresis to new candidate
+      // If restart, need to compute distance travaled from last either from current or average
+      // This is necessary to compute the new primal weight
+
+#ifdef PDLP_DEBUG_MODE
+      RAFT_CUDA_TRY(cudaDeviceSynchronize());
+      std::cout << "  Doing KKT restart" << std::endl;
+#endif
+
+      // Set which localized_duality_gap_container will be used for candidate
+      // (We could save the container copy but compute_distance_traveled_from_last_restart works with
+      // containers)
+      if (restart_to_average && !hyper_params_.never_restart_to_average) {
+#ifdef PDLP_DEBUG_MODE
+        RAFT_CUDA_TRY(cudaDeviceSynchronize());
+        std::cout << "    KKT restart to average" << std::endl;
+#endif
+
+        raft::copy(avg_duality_gap_.primal_solution_.data(),
+                   primal_solution_avg.data(),
+                   primal_size_h_,
+                   stream_view_);
+        raft::copy(avg_duality_gap_.dual_solution_.data(),
+                   dual_solution_avg.data(),
+                   dual_size_h_,
+                   stream_view_);
+        candidate_duality_gap_ = &avg_duality_gap_;
+      } else {
+#ifdef PDLP_DEBUG_MODE
+        RAFT_CUDA_TRY(cudaDeviceSynchronize());
+        std::cout << "    KKT no restart to average" << std::endl;
+#endif
+        raft::copy(current_duality_gap_.primal_solution_.data(),
+                   pdhg_solver.get_saddle_point_state().get_primal_solution().data(),
+                   primal_size_h_,
+                   stream_view_);
+        raft::copy(current_duality_gap_.dual_solution_.data(),
+                   pdhg_solver.get_saddle_point_state().get_dual_solution().data(),
+                   dual_size_h_,
+                   stream_view_);
+        candidate_duality_gap_ = &current_duality_gap_;
+      }
+
+      if (restart_to_average && !hyper_params_.never_restart_to_average) {
+        // Candidate is pointing to the average
+        raft::copy(pdhg_solver.get_primal_solution().data(),
+                   candidate_duality_gap_->primal_solution_.data(),
+                   primal_size_h_,
+                   stream_view_);
+        raft::copy(pdhg_solver.get_dual_solution().data(),
+                   candidate_duality_gap_->dual_solution_.data(),
+                   dual_size_h_,
+                   stream_view_);
+        set_last_restart_was_average(true);
+      } else
+        set_last_restart_was_average(false);
     }
 
     // Comupute distance traveled
@@ -638,20 +689,6 @@ bool pdlp_restart_strategy_t<i_t, f_t>::run_kkt_restart(
                                                 primal_weight,
                                                 pdhg_solver.get_primal_tmp_resource(),
                                                 pdhg_solver.get_dual_tmp_resource());
-
-    if (restart_to_average && !hyper_params_.never_restart_to_average) {
-      // Candidate is pointing to the average
-      raft::copy(pdhg_solver.get_primal_solution().data(),
-                 candidate_duality_gap_->primal_solution_.data(),
-                 primal_size_h_,
-                 stream_view_);
-      raft::copy(pdhg_solver.get_dual_solution().data(),
-                 candidate_duality_gap_->dual_solution_.data(),
-                 dual_size_h_,
-                 stream_view_);
-      set_last_restart_was_average(true);
-    } else
-      set_last_restart_was_average(false);
 
     if (hyper_params_.compute_last_restart_before_new_primal_weight) {
       // Save last restart data (primal/dual solution and distance traveled)
@@ -675,6 +712,36 @@ bool pdlp_restart_strategy_t<i_t, f_t>::run_kkt_restart(
     RAFT_CUDA_TRY(cudaDeviceSynchronize());
     std::cout << "KKT conditions not met for a restart" << std::endl;
 #endif
+  }
+
+  // Update best-KKT checkpoint if we found a better merit
+  if (candidate_kkt_score < best_kkt_merit_) {
+#ifdef PDLP_DEBUG_MODE
+    RAFT_CUDA_TRY(cudaDeviceSynchronize());
+    std::cout << "    Updating best-KKT checkpoint: old=" << best_kkt_merit_ 
+              << " new=" << candidate_kkt_score << std::endl;
+#endif
+    best_kkt_merit_ = candidate_kkt_score;
+    // Store the current iterate as the best checkpoint
+    if (restart_to_average && !hyper_params_.never_restart_to_average) {
+      raft::copy(best_kkt_checkpoint_primal_.data(),
+                 primal_solution_avg.data(),
+                 primal_size_h_,
+                 stream_view_);
+      raft::copy(best_kkt_checkpoint_dual_.data(),
+                 dual_solution_avg.data(),
+                 dual_size_h_,
+                 stream_view_);
+    } else {
+      raft::copy(best_kkt_checkpoint_primal_.data(),
+                 pdhg_solver.get_saddle_point_state().get_primal_solution().data(),
+                 primal_size_h_,
+                 stream_view_);
+      raft::copy(best_kkt_checkpoint_dual_.data(),
+                 pdhg_solver.get_saddle_point_state().get_dual_solution().data(),
+                 dual_size_h_,
+                 stream_view_);
+    }
   }
 
   // Record last kkt candidate
