@@ -1189,6 +1189,29 @@ std::optional<optimization_problem_solution_t<i_t, f_t>> pdlp_solver_t<i_t, f_t>
     return check_limits(timer);
   }
 
+  // Evaluator observability hook: emit the normalized convergence quantities
+  // at every actual termination check. This is deliberately read-only and
+  // mirrors the predicates for equal absolute and relative tolerances:
+  //   raw <= tolerance * (1 + normalization_term).
+  // A strict run can therefore be replayed at a looser tolerance without
+  // changing the solver trajectory or launching a second solve.
+  if (!inside_mip_) {
+    const auto print_hive_tolerance_trace = [&](const char* iterate,
+                                                 const auto& strategy) {
+      const auto& info = strategy.get_convergence_information();
+      CUOPT_LOG_INFO("HIVE_TOLERANCE_TRACE %s %d %.17e %.17e %.17e",
+                     iterate,
+                     total_pdlp_iterations_,
+                     info.get_relative_gap_value(),
+                     info.get_relative_l2_primal_residual_value(),
+                     info.get_relative_l2_dual_residual_value());
+    };
+    print_hive_tolerance_trace("current", current_termination_strategy_);
+    if (!settings_.hyper_params.never_restart_to_average) {
+      print_hive_tolerance_trace("average", average_termination_strategy_);
+    }
+  }
+
   // Handle the batch case separetly
   if (batch_mode_) { return check_batch_termination(timer); }
 
@@ -2831,6 +2854,26 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
         "   Iter    Primal Obj.      Dual Obj.    Gap        Primal Res.  Dual Res.   Time");
     }
   }
+  // Cadence at which the (Halpern) restart criterion is evaluated. The restarted-Halpern
+  // scheme is only accelerated if an epoch is ended as soon as its fixed-point residual
+  // has decayed enough; tying that decision to the major iteration forces every epoch to
+  // be a multiple of major_iteration. Termination checks, their cadence, the reported
+  // convergence trace and the iteration accounting are untouched: only the restart
+  // decision (and the cheap fixed-point residual it consumes) is evaluated more often.
+  const bool fine_grained_restart = is_cupdlpx_restart<i_t, f_t>(settings_.hyper_params) &&
+                                    settings_.hyper_params.use_reflected_primal_dual &&
+                                    settings_.hyper_params.use_fixed_point_error && !batch_mode_ &&
+                                    !is_distributed_master();
+  const i_t restart_check_frequency =
+    fine_grained_restart
+      ? std::max(i_t(1),
+                 std::min(static_cast<i_t>(settings_.hyper_params.restart_check_frequency),
+                          static_cast<i_t>(settings_.hyper_params.major_iteration)))
+      : static_cast<i_t>(settings_.hyper_params.major_iteration);
+  // Kept alive across iterations: a restart taken at the end of an iteration is consumed
+  // by the fixed-point-residual computation of the next one (it seeds the new epoch).
+  std::vector<int> has_restarted(climber_strategies_.size(), 0);
+
   while (true) {
 #ifdef CUPDLP_DEBUG_MODE
     printf("Step: %d\n", total_pdlp_iterations_);
@@ -2841,7 +2884,6 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
       (total_pdlp_iterations_ <= settings_.hyper_params.min_iteration_restart);
     bool error_occured                      = (step_size_strategy_.get_valid_step_size() == -1);
     bool artificial_restart_check_main_loop = false;
-    std::vector<int> has_restarted(climber_strategies_.size(), 0);
     bool is_conditional_major =
       (settings_.hyper_params.use_conditional_major)
         ? (total_pdlp_iterations_ % conditional_major<i_t>(total_pdlp_iterations_)) == 0
@@ -2996,7 +3038,7 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
       if (settings_.hyper_params.restart_strategy !=
             static_cast<int>(
               pdlp::pdlp_restart_strategy_t<i_t, f_t>::restart_strategy_t::NO_RESTART) &&
-          (is_major_iteration || artificial_restart_check_main_loop)) {
+          !fine_grained_restart && (is_major_iteration || artificial_restart_check_main_loop)) {
         restart_strategy_.compute_restart(
           pdhg_solver_,
           unscaled_primal_avg_solution_,
@@ -3049,12 +3091,19 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
     printf("Is Major %d\n",
            (total_pdlp_iterations_ + 1) % settings_.hyper_params.major_iteration == 0);
 #endif
-    take_step(total_pdlp_iterations_,
-              (total_pdlp_iterations_ + 1) % settings_.hyper_params.major_iteration == 0);
+    // A restart-check iteration needs the proximal point T(z) (potential_next_*), exactly
+    // like a major iteration does. With restart_check_frequency == major_iteration this is
+    // bit-for-bit the previous behavior.
+    const bool next_is_major_iteration =
+      (total_pdlp_iterations_ + 1) % settings_.hyper_params.major_iteration == 0;
+    const bool restart_check_now = (total_pdlp_iterations_ + 1) % restart_check_frequency == 0;
 
+    take_step(total_pdlp_iterations_, next_is_major_iteration || restart_check_now);
+
+    bool restarted_now = false;
     if (settings_.hyper_params.use_reflected_primal_dual) {
       if (settings_.hyper_params.use_fixed_point_error &&
-          ((total_pdlp_iterations_ + 1) % settings_.hyper_params.major_iteration == 0 ||
+          (next_is_major_iteration || restart_check_now ||
            std::any_of(has_restarted.begin(), has_restarted.end(), [](int restarted) {
              return restarted == 1;
            }))) {
@@ -3087,12 +3136,35 @@ optimization_problem_solution_t<i_t, f_t> pdlp_solver_t<i_t, f_t>::run_solver(co
           transpose_problem_fields(/*to_row=*/true);
         }
       }
-      halpern_update();
+      // Restart decision on the fresh fixed-point residual of the current iterate. Taking it
+      // here (instead of at the top of the next iteration) is equivalent: the restart simply
+      // replaces the Halpern update by z <- T(z), re-anchors the epoch there and leaves the
+      // proximal pair that the next termination check evaluates untouched.
+      if (fine_grained_restart && restart_check_now) {
+        restart_strategy_.compute_restart(
+          pdhg_solver_,
+          unscaled_primal_avg_solution_,
+          unscaled_dual_avg_solution_,
+          total_pdlp_iterations_ + 1,
+          primal_step_size_,
+          dual_step_size_,
+          primal_weight_,
+          step_size_,
+          current_termination_strategy_.get_convergence_information(),
+          average_termination_strategy_.get_convergence_information(),
+          best_primal_weight_,
+          has_restarted);
+        restarted_now = std::any_of(
+          has_restarted.begin(), has_restarted.end(), [](int restarted) { return restarted == 1; });
+      }
+      // A restart already moved the iterate to T(z) and reset the anchor: the Halpern update
+      // (and the epoch counter increment) of this iteration is what it replaces.
+      if (!restarted_now) { halpern_update(); }
     }
 
     ++total_pdlp_iterations_;
     ++internal_solver_iterations_;
-    if (settings_.hyper_params.never_restart_to_average) {
+    if (settings_.hyper_params.never_restart_to_average && !restarted_now) {
       restart_strategy_.increment_iteration_since_last_restart();
       if (is_distributed_master()) {
         multi_gpu_engine->for_each_shard([&](auto& shard) {

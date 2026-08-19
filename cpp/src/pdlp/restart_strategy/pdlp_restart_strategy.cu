@@ -768,12 +768,20 @@ void pdlp_restart_strategy_t<i_t, f_t>::should_cupdlpx_restart(i_t total_number_
   print("fixed_point_error", fixed_point_error_);
 #endif
 
-  if (total_number_of_iterations == hyper_params_.major_iteration) {
+  // The very first restart check seeds the epoch: initial_fixed_point_error_ is only ever
+  // set right after a restart, so before that there is nothing to compare against. This is
+  // cadence independent (it used to be keyed to the first major iteration).
+  const bool no_epoch_started_yet =
+    std::any_of(initial_fixed_point_error_.begin(),
+                initial_fixed_point_error_.end(),
+                [](f_t value) { return std::isnan(value); });
+
+  if (no_epoch_started_yet) {
 #ifdef CUPDLP_DEBUG_MODE
-    printf("forced restart at first major\n");
+    printf("forced restart at first restart check\n");
 #endif
     std::fill(should_restart.begin(), should_restart.end(), 1);
-  } else if (total_number_of_iterations > hyper_params_.major_iteration) {
+  } else {
     // For now just taking the average and restarting everyone or no one
     for (size_t i = 0; i < climber_strategies_.size(); ++i) {
       cuopt_assert(

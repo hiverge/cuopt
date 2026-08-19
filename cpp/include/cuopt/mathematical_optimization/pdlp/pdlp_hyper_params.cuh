@@ -21,6 +21,11 @@ struct pdlp_hyper_params_t {
   double initial_primal_weight_c_scaling            = 1.0;
   double initial_primal_weight_b_scaling            = 1.0;
   int major_iteration                               = 200;
+  // Cadence (in PDLP iterations) at which the restart criterion is evaluated.
+  // Only used by the Halpern (cuPDLPx) restart scheme; must divide major_iteration.
+  // It does NOT change the major iteration nor the termination-check cadence: it only
+  // decouples the restart decision from them.
+  int restart_check_frequency                       = 200;
   int min_iteration_restart                         = 0;
   int restart_strategy                              = 3;
   bool never_restart_to_average                     = true;

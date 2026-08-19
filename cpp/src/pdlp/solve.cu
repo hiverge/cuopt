@@ -202,7 +202,12 @@ static void set_Stable3(pdlp::pdlp_hyper_params_t& hyper_params)
            // TODO try with false
   hyper_params.initial_primal_weight_c_scaling  = 1.0;
   hyper_params.initial_primal_weight_b_scaling  = 1.0;
-  hyper_params.major_iteration                  = 200;  // TODO Try with something smaller
+  hyper_params.major_iteration                  = 200;
+  // Restarted-Halpern theory wants a restart as soon as the fixed-point residual has
+  // decayed enough. Evaluating that criterion only every major iteration forces every
+  // epoch to be a multiple of 200 and destroys the accelerated (restarted) linear rate,
+  // so the decision is evaluated on a finer cadence (termination checks are untouched).
+  hyper_params.restart_check_frequency          = 20;
   hyper_params.min_iteration_restart            = 0;
   hyper_params.restart_strategy                 = 3;
   hyper_params.never_restart_to_average         = true;
